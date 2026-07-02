@@ -71,6 +71,8 @@
 // It is called repeatedly for a given code until it returns true for that code.
 bool GCodes::ActOnCode(GCodeBuffer& gb, const StringRef& reply) noexcept
 {
+	const bool startingCommand = gb.IsReady();								// false on repeated calls for commands that return notFinished
+
 #if SUPPORT_ASYNC_MOVES
 	// If we are running multiple motion systems in single input stream mode and we have resumed after a pause, then we may need to skip some commands
 	// Also if we did a synchronous pause then we need to sip the pause command
@@ -108,6 +110,11 @@ bool GCodes::ActOnCode(GCodeBuffer& gb, const StringRef& reply) noexcept
 		}
 	}
 #endif
+
+	if (startingCommand)
+	{
+		DebugGCodeCommand(gb);
+	}
 
 	try
 	{

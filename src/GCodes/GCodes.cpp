@@ -3159,6 +3159,11 @@ bool GCodes::DoFileMacro(GCodeBuffer& gb, const char* fileName, bool reportMissi
 		gb.SavePrintingFilePosition();
 	}
 
+#if HAS_MASS_STORAGE || HAS_EMBEDDED_FILES
+	String<MaxFilenameLength> fullMacroFileName;
+	const bool haveFullMacroFileName = platform.MakeSysFileName(fullMacroFileName.GetRef(), fileName);
+#endif
+
 #if HAS_SBC_INTERFACE
 	if (reprap.UsingSbcInterface())
 	{
@@ -3182,6 +3187,7 @@ bool GCodes::DoFileMacro(GCodeBuffer& gb, const char* fileName, bool reportMissi
 			return true;
 		}
 		gb.GetVariables().AssignFrom(initialVariables);
+		gb.LatestMachineState().SetFileName(fileName);
 		gb.StartNewFile();
 		if (gb.IsMacroEmpty())
 		{
@@ -3210,6 +3216,7 @@ bool GCodes::DoFileMacro(GCodeBuffer& gb, const char* fileName, bool reportMissi
 		}
 		gb.GetVariables().AssignFrom(initialVariables);
 		gb.LatestMachineState().fileState.Set(f);
+		gb.LatestMachineState().SetFileName(haveFullMacroFileName ? fullMacroFileName.c_str() : fileName);
 		gb.StartNewFile();
 		gb.GetFileInput()->Reset(gb.LatestMachineState().fileState);
 #else
@@ -3459,6 +3466,11 @@ void GCodes::StartPrinting(bool fromStart) noexcept
 	FileGCode()->StartNewFile();
 
 	reprap.GetPrintMonitor().StartedPrint();
+	const char * const printingFileName = reprap.GetPrintMonitor().GetPrintingFilename();
+	if (printingFileName != nullptr)
+	{
+		FileGCode()->OriginalMachineState().SetFileName(printingFileName);
+	}
 	platform.MessageF(LogWarn,
 						(IsSimulating()) ? "Started simulating printing file %s\n" : "Started printing file %s\n",
 							reprap.GetPrintMonitor().GetPrintingFilename());
@@ -3892,6 +3904,306 @@ void GCodes::SetMappedFanSpeed(const GCodeBuffer *null gbp, float f) noexcept
 	{
 		ms.currentTool->SetFansPwm(f);
 	}
+}
+
+namespace
+{
+	constexpr uint16_t DebugGCodeMetaChannel = 0x0001;
+	constexpr uint16_t DebugGCodeMetaLine = 0x0002;
+	constexpr uint16_t DebugGCodeMetaFile = 0x0004;
+	constexpr uint16_t DebugGCodeMetaSource = 0x0008;
+	constexpr uint16_t DebugGCodeMetaStack = 0x0010;
+	constexpr uint16_t DebugGCodeMetaIndent = 0x0020;
+	constexpr uint16_t DebugGCodeMetaPosition = 0x0040;
+	constexpr uint16_t DebugGCodeMetaQueue = 0x0080;
+	constexpr uint16_t DebugGCodeMetaState = 0x0100;
+
+	constexpr uint16_t DebugGCodeDefaultMeta = DebugGCodeMetaChannel | DebugGCodeMetaLine | DebugGCodeMetaFile | DebugGCodeMetaSource;
+	constexpr uint16_t DebugGCodeAllMeta = DebugGCodeMetaChannel | DebugGCodeMetaLine | DebugGCodeMetaFile | DebugGCodeMetaSource |
+									DebugGCodeMetaStack | DebugGCodeMetaIndent | DebugGCodeMetaPosition | DebugGCodeMetaQueue | DebugGCodeMetaState;
+
+	char DebugGCodeToLower(char c) noexcept
+	{
+		return (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
+	}
+
+	bool DebugGCodeIsSeparator(char c) noexcept
+	{
+		return c == '\0' || c == ':' || c == '+' || c == ',' || c == ';' || c == '|' || c == ' ' || c == '\t';
+	}
+
+	const char *DebugGCodeSkipSeparators(const char *p) noexcept
+	{
+		while (*p == ':' || *p == '+' || *p == ',' || *p == ';' || *p == '|' || *p == ' ' || *p == '\t')
+		{
+			++p;
+		}
+		return p;
+	}
+
+	bool DebugGCodeTokenEquals(const char *start, const char *end, const char *token) noexcept
+	{
+		while (start < end && *token != '\0')
+		{
+			if (DebugGCodeToLower(*start) != DebugGCodeToLower(*token))
+			{
+				return false;
+			}
+			++start;
+			++token;
+		}
+		return start == end && *token == '\0';
+	}
+
+	bool DebugGCodeOptionPresent(const char *options, const char *token) noexcept
+	{
+		const char *p = options;
+		while (*p != '\0')
+		{
+			p = DebugGCodeSkipSeparators(p);
+			const char * const start = p;
+			while (!DebugGCodeIsSeparator(*p))
+			{
+				++p;
+			}
+			if (p > start && DebugGCodeTokenEquals(start, p, token))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+}
+
+// Return where debug G-code logging should be sent, or NoDestinationMessage if disabled.
+// Controlled by a user global variable. Destination tokens may be in any order and
+// may be separated by '|', ':', '+', ',', ';' or whitespace:
+//   global.debugGCode = null, "off", or missing                    -> disabled
+//   global.debugGCode = "usb"                                      -> USB ACM only, default metadata
+//   global.debugGCode = "dwc"                                      -> DWC/web HTTP only, default metadata
+//   global.debugGCode = "telnet"                                   -> Telnet only, default metadata
+//   global.debugGCode = "dwc|telnet|usb"                           -> DWC/web HTTP + Telnet + USB ACM
+//   global.debugGCode = "usb|telnet:stack,pos"                     -> USB + Telnet with selected extra metadata
+//   global.debugGCode = "both"                                     -> USB ACM and DWC/web HTTP, default metadata
+//   global.debugGCode = "both|telnet:all"                          -> USB ACM + DWC/web HTTP + Telnet with all metadata
+MessageType GCodes::GetDebugGCodeMessageType(uint16_t& metaFlags) const noexcept
+{
+	metaFlags = 0;
+#if SUPPORT_OBJECT_MODEL
+	ReadLockedPointer<const VariableSet> vars = reprap.GetGlobalVariablesForReading();
+	if (vars.Ptr() == nullptr)
+	{
+		return NoDestinationMessage;
+	}
+
+	const Variable * const v = vars->Lookup("debugGCode", strlen("debugGCode"), false);
+	if (v == nullptr)
+	{
+		return NoDestinationMessage;
+	}
+
+	const ExpressionValue val = v->GetValue();
+	if (val.GetType() == TypeCode::None)
+	{
+		return NoDestinationMessage;
+	}
+
+	String<StringLength256> mode;
+	val.AppendAsString(mode.GetRef());
+	const char * const modeString = mode.c_str();
+
+	if (DebugGCodeOptionPresent(modeString, "off"))
+	{
+		return NoDestinationMessage;
+	}
+
+	MessageType destination = NoDestinationMessage;
+	if (DebugGCodeOptionPresent(modeString, "usb"))
+	{
+		destination = (MessageType)((uint32_t)destination | (uint32_t)UsbMessage);
+	}
+	if (DebugGCodeOptionPresent(modeString, "telnet"))
+	{
+		destination = (MessageType)((uint32_t)destination | (uint32_t)TelnetMessage);
+	}
+	if (DebugGCodeOptionPresent(modeString, "dwc") || DebugGCodeOptionPresent(modeString, "web") || DebugGCodeOptionPresent(modeString, "http"))
+	{
+		destination = (MessageType)((uint32_t)destination | (uint32_t)HttpMessage);
+	}
+	if (DebugGCodeOptionPresent(modeString, "both"))
+	{
+		destination = (MessageType)((uint32_t)destination | (uint32_t)UsbMessage | (uint32_t)HttpMessage);
+	}
+	if (destination == NoDestinationMessage)
+	{
+		return NoDestinationMessage;
+	}
+
+	if (DebugGCodeOptionPresent(modeString, "all") || DebugGCodeOptionPresent(modeString, "full"))
+	{
+		metaFlags = DebugGCodeAllMeta;
+	}
+	else if (DebugGCodeOptionPresent(modeString, "minimal") || DebugGCodeOptionPresent(modeString, "bare"))
+	{
+		metaFlags = 0;
+	}
+	else
+	{
+		metaFlags = DebugGCodeDefaultMeta;
+
+		if (DebugGCodeOptionPresent(modeString, "channel"))
+		{
+			metaFlags |= DebugGCodeMetaChannel;
+		}
+		if (DebugGCodeOptionPresent(modeString, "line"))
+		{
+			metaFlags |= DebugGCodeMetaLine;
+		}
+		if (DebugGCodeOptionPresent(modeString, "file"))
+		{
+			metaFlags |= DebugGCodeMetaFile;
+		}
+		if (DebugGCodeOptionPresent(modeString, "source"))
+		{
+			metaFlags |= DebugGCodeMetaSource;
+		}
+		if (DebugGCodeOptionPresent(modeString, "stack"))
+		{
+			metaFlags |= DebugGCodeMetaStack;
+		}
+		if (DebugGCodeOptionPresent(modeString, "indent"))
+		{
+			metaFlags |= DebugGCodeMetaIndent;
+		}
+		if (DebugGCodeOptionPresent(modeString, "pos") || DebugGCodeOptionPresent(modeString, "position"))
+		{
+			metaFlags |= DebugGCodeMetaPosition;
+		}
+		if (DebugGCodeOptionPresent(modeString, "queue"))
+		{
+			metaFlags |= DebugGCodeMetaQueue;
+		}
+		if (DebugGCodeOptionPresent(modeString, "state"))
+		{
+			metaFlags |= DebugGCodeMetaState;
+		}
+
+		if (DebugGCodeOptionPresent(modeString, "nofile"))
+		{
+			metaFlags &= ~DebugGCodeMetaFile;
+		}
+		if (DebugGCodeOptionPresent(modeString, "noline"))
+		{
+			metaFlags &= ~DebugGCodeMetaLine;
+		}
+		if (DebugGCodeOptionPresent(modeString, "nochannel"))
+		{
+			metaFlags &= ~DebugGCodeMetaChannel;
+		}
+		if (DebugGCodeOptionPresent(modeString, "nosource"))
+		{
+			metaFlags &= ~DebugGCodeMetaSource;
+		}
+	}
+	return destination;
+#else
+	return NoDestinationMessage;
+#endif
+}
+
+// Log the G-code or meta-command that is about to be executed, if global.debugGCode enables it.
+void GCodes::DebugGCodeCommand(const GCodeBuffer& gb) const noexcept
+{
+	uint16_t metaFlags;
+	const MessageType mt = GetDebugGCodeMessageType(metaFlags);
+	if (mt == NoDestinationMessage)
+	{
+		return;
+	}
+
+	// Q0 is the internal command used for whole-line comments. It is not a real executable G-code command.
+	if (gb.GetCommandLetter() == 'Q' && gb.HasCommandNumber() && gb.GetCommandNumber() == 0)
+	{
+		return;
+	}
+
+	String<StringLength256> msg;
+	msg.copy("DBG-GCODE");
+
+	if ((metaFlags & DebugGCodeMetaChannel) != 0)
+	{
+		msg.cat(" channel=");
+		msg.cat(gb.GetChannel().ToString());
+	}
+
+	if ((metaFlags & DebugGCodeMetaSource) != 0)
+	{
+		msg.cat(" source=");
+		msg.cat((gb.IsDoingFileMacro()) ? "macro" : (gb.IsDoingFile()) ? "file" : "input");
+	}
+
+	if ((metaFlags & DebugGCodeMetaFile) != 0)
+	{
+		const char * const fileName = gb.GetCurrentFileName();
+		if (fileName != nullptr)
+		{
+			msg.cat(" file=\"");
+			msg.cat(fileName);
+			msg.cat('"');
+		}
+	}
+
+	if ((metaFlags & DebugGCodeMetaLine) != 0)
+	{
+		const uint32_t line = gb.GetLineNumber();
+		if (line != 0)
+		{
+			msg.catf(" line=%" PRIu32, line);
+		}
+	}
+
+	if ((metaFlags & DebugGCodeMetaStack) != 0)
+	{
+		msg.catf(" stack=%u", gb.GetStackDepth());
+	}
+
+	if ((metaFlags & DebugGCodeMetaIndent) != 0)
+	{
+		msg.catf(" indent=%u", gb.GetBlockIndent());
+	}
+
+	if ((metaFlags & DebugGCodeMetaPosition) != 0)
+	{
+		const FilePosition jobPos = gb.GetJobFilePosition();
+		if (jobPos != noFilePosition)
+		{
+			msg.catf(" pos=%" PRIu32, jobPos);
+		}
+
+		const FilePosition printPos = gb.GetPrintingFilePosition(true);
+		if (printPos != noFilePosition)
+		{
+			msg.catf(" printPos=%" PRIu32, printPos);
+		}
+	}
+
+#if SUPPORT_ASYNC_MOVES
+	if ((metaFlags & DebugGCodeMetaQueue) != 0)
+	{
+		msg.catf(" queue=%u", (unsigned int)gb.GetActiveQueueNumber());
+	}
+#endif
+
+	if ((metaFlags & DebugGCodeMetaState) != 0)
+	{
+		msg.catf(" state=%u", (unsigned int)gb.GetState());
+	}
+
+	msg.cat(": ");
+	gb.AppendFullCommand(msg.GetRef());
+	msg.cat('\n');
+	platform.Message(mt, msg.c_str());
 }
 
 // Handle sending a reply back to the appropriate interface(s) and update lastResult

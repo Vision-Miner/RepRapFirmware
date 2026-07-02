@@ -232,6 +232,12 @@ public:
 #if HAS_MASS_STORAGE || HAS_EMBEDDED_FILES
 	FileData fileState;
 #endif
+#if HAS_MASS_STORAGE || HAS_SBC_INTERFACE || HAS_EMBEDDED_FILES
+	String<MaxFilenameLength> fileName;										// Full or requested path of the file/macro being executed
+
+	void SetFileName(const char *name) noexcept { fileName.copy(name); }
+	const char *GetFileName() const noexcept { return fileName.IsEmpty() ? nullptr : fileName.c_str(); }
+#endif
 #if HAS_SBC_INTERFACE
 	FileId fileId;													// virtual ID to distinguish files in different stack levels (only unique per GB)
 #endif

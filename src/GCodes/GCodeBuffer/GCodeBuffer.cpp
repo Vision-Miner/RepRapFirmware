@@ -930,6 +930,15 @@ GCodeMachineState& GCodeBuffer::CurrentFileMachineState() const noexcept
 	return *ms;
 }
 
+const char *GCodeBuffer::GetCurrentFileName() const noexcept
+{
+#if HAS_MASS_STORAGE || HAS_SBC_INTERFACE || HAS_EMBEDDED_FILES
+	return CurrentFileMachineState().GetFileName();
+#else
+	return nullptr;
+#endif
+}
+
 // Return true if all GCodes machine states on the stack are 'normal'
 bool GCodeBuffer::AllStatesNormal() const noexcept
 {

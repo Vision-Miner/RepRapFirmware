@@ -65,6 +65,9 @@ GCodeMachineState::GCodeMachineState(GCodeMachineState& prev, bool withinSameFil
 {
 	if (withinSameFile)
 	{
+#if HAS_MASS_STORAGE || HAS_SBC_INTERFACE || HAS_EMBEDDED_FILES
+		fileName.copy(prev.fileName.c_str());
+#endif
 		// Copy the block states from the previous MachineState to the new one
 		const BlockState *src = prev.currentBlockState;
 		BlockState *dst = currentBlockState;
@@ -84,6 +87,9 @@ GCodeMachineState::GCodeMachineState(GCodeMachineState& prev, bool withinSameFil
 	}
 	else
 	{
+#if HAS_MASS_STORAGE || HAS_SBC_INTERFACE || HAS_EMBEDDED_FILES
+		fileName.Clear();
+#endif
 		currentBlockState->SetPlainBlock(0);
 		macroRestartable = false;
 	}
@@ -128,6 +134,9 @@ GCodeMachineState::GCodeMachineState(GCodeMachineState& copyFrom, GCodeMachineSt
 			fileState.Set(MassStorage::DuplicateOpenHandle(copyFrom.fileState.GetUnderlyingFile()));
 		}
 	}
+#endif
+#if HAS_MASS_STORAGE || HAS_SBC_INTERFACE || HAS_EMBEDDED_FILES
+	fileName.copy(copyFrom.fileName.c_str());
 #endif
 	copyFrom.ownQueueNumber = oldExecuteQueue;
 	copyFrom.executeAllCommands = false;
@@ -243,6 +252,9 @@ void GCodeMachineState::CloseFile() noexcept
 		fileState.Close();
 #endif
 	}
+#if HAS_MASS_STORAGE || HAS_SBC_INTERFACE || HAS_EMBEDDED_FILES
+	fileName.Clear();
+#endif
 }
 
 void GCodeMachineState::WaitForAcknowledgement(uint32_t seq) noexcept

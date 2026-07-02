@@ -427,6 +427,7 @@ bool StringParser::CheckMetaCommand(const StringRef& reply) THROWS(GCodeExceptio
 		{
 			CheckForMixedSpacesAndTabs();
 		}
+		reprap.GetGCodes().DebugGCodeCommand(gb);
 		Init();
 	}
 	else

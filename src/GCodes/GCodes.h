@@ -211,6 +211,7 @@ public:
 
 	void SetMappedFanSpeed(const GCodeBuffer *null gb, float f) noexcept;				// Set the speeds of fans mapped for the current tool
 	void HandleReply(GCodeBuffer& gb, GCodeResult rslt, const char *reply) noexcept;	// Handle G-Code replies
+	void DebugGCodeCommand(const GCodeBuffer& gb) const noexcept;				// Log the G-code or meta-command that is about to be executed, if global.debugGCode enables it
 	void EmergencyStop() noexcept;													// Cancel everything
 
 	const GridDefinition& GetDefaultGrid() const { return defaultGrid; };			// Get the default grid definition
@@ -396,6 +397,7 @@ private:
 
 	void HandleReply(GCodeBuffer& gb, OutputBuffer *reply) noexcept;
 	void HandleReplyPreserveResult(GCodeBuffer& gb, GCodeResult rslt, const char *reply) noexcept;	// Handle G-Code replies
+	MessageType GetDebugGCodeMessageType(uint16_t& metaFlags) const noexcept;				// Return where debug G-code logging should be sent, or NoDestinationMessage
 
 	GCodeResult TryMacroFile(GCodeBuffer& gb) THROWS(GCodeException);								// Try to find a macro file that implements a G or M command
 
