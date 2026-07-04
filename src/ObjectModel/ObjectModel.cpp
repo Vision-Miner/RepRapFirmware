@@ -609,12 +609,12 @@ bool ObjectExplorationContext::ShouldReport(const ObjectModelEntryFlags f) const
 
 GCodeException ObjectExplorationContext::ConstructParseException(const char *msg) const noexcept
 {
-	return GCodeException(line, column, msg);
+	return (gb != nullptr) ? GCodeException(gb, column, msg) : GCodeException(line, column, msg);
 }
 
 GCodeException ObjectExplorationContext::ConstructParseException(const char *msg, const char *sparam) const noexcept
 {
-	return GCodeException(line, column, msg, sparam);
+	return (gb != nullptr) ? GCodeException(gb, column, msg, sparam) : GCodeException(line, column, msg, sparam);
 }
 
 // Call this before making a recursive call, or before calling a function that needs a lot of stack from a recursive function

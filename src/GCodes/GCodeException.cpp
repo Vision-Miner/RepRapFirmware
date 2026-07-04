@@ -56,23 +56,42 @@ GCodeException::GCodeException(const GCodeBuffer *null gb, int col, const char *
 // Construct the error message. This will be prefixed with "Error: " when it is returned to the user.
 void GCodeException::GetMessage(const StringRef &reply, const GCodeBuffer *null gb) const noexcept
 {
-	// Print the file location, if possible
-	switch(source)
+	// Print the file location, if possible. For exceptions that were created without
+	// a GCodeBuffer (for example low-level ArrayHandle exceptions), fall back to the
+	// buffer passed to GetMessage so that file/macro context is still reported.
+	const bool doingFileMacro = source == GCodeExceptionSource::macro
+							  || (source == GCodeExceptionSource::other && gb != nullptr && gb->IsDoingFileMacro());
+	const bool doingFile = source == GCodeExceptionSource::file
+					 || (source == GCodeExceptionSource::other && gb != nullptr && gb->IsDoingFile() && !doingFileMacro);
+	const char * const currentFileName = (gb != nullptr) ? gb->GetCurrentFileName() : nullptr;
+
+	if (doingFile)
 	{
-	case GCodeExceptionSource::file:
-		reply.copy("in GCode file");
-		break;
-	case GCodeExceptionSource::macro:
-		reply.copy("in file macro");
-		break;
-	case GCodeExceptionSource::other:
-	default:
-		break;
+		if (currentFileName != nullptr)
+		{
+			reply.printf("in GCode file \"%s\"", currentFileName);
+		}
+		else
+		{
+			reply.copy("in GCode file");
+		}
+	}
+	else if (doingFileMacro)
+	{
+		if (currentFileName != nullptr)
+		{
+			reply.printf("in file macro \"%s\"", currentFileName);
+		}
+		else
+		{
+			reply.copy("in file macro");
+		}
 	}
 
-	if (line >= 0)
+	const int effectiveLine = (line >= 0) ? line : ((gb != nullptr && (doingFile || doingFileMacro)) ? gb->GetLineNumber() : -1);
+	if (effectiveLine >= 0)
 	{
-		reply.catf(" line %d", line);
+		reply.catf(" line %d", effectiveLine);
 		if (column >= 0)
 		{
 			reply.catf(" column %d", column + 1);
@@ -82,6 +101,10 @@ void GCodeException::GetMessage(const StringRef &reply, const GCodeBuffer *null 
 	else if (column >= 0)
 	{
 		reply.catf(" at column %d: ", column + 1);
+	}
+	else if (!reply.IsEmpty())
+	{
+		reply.cat(": ");
 	}
 	else
 	{
