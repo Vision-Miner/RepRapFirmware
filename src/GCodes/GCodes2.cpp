@@ -4790,6 +4790,17 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 				}
 				break;
 
+			case 1000:	// Custom debug (VisionMiner): dump internal per-axis motor step state and shared-driver desync
+				if (!LockAllMovementSystemsAndWaitForStandstill(gb))
+				{
+					return false;
+				}
+				// Emit line-by-line (not one big OutputBuffer chain): during a print the free-buffer
+				// pool is under load, so a long chained dump would hit Allocate failure and silently
+				// truncate (OutputBuffer hadOverflow). Per-line messages need only one block at a time.
+				DumpMotorState(gb.GetResponseMessageType());
+				break;
+
 			default:
 #if HAS_SBC_INTERFACE
 				// Send unknown non-binary codes to DSF so potential plugins can interpret them

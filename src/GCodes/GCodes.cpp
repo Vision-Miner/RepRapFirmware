@@ -4206,6 +4206,130 @@ void GCodes::DebugGCodeCommand(const GCodeBuffer& gb) const noexcept
 	platform.Message(mt, msg.c_str());
 }
 
+// M1000: dump the firmware's internal per-axis motor step state.
+// RRF stores motor position per LOGICAL AXIS (the step endpoint of the last completed move), never per
+// physical driver. When several axes share one physical driver (e.g. Z + the hidden V/W/A leadscrew
+// phantoms) each keeps an INDEPENDENT step endpoint, and the difference between them is exactly the
+// desync that can distort a shared-leadscrew bed. This command is read-only: it reports state and
+// changes nothing. The caller (HandleMcode case 1000) has already taken the movement lock and waited
+// for standstill (so the endpoints are the settled last-move values) and has allocated 'buf'.
+void GCodes::DumpMotorState(MessageType mt) const noexcept
+{
+	Move& mv = reprap.GetMove();
+	String<StringLength256> line;
+
+	platform.Message(mt, "M1000 motor-state dump v2\n");
+
+	// 1) Per motion system: the settled step endpoint of every logical axis (including hidden ones),
+	//    its mm equivalent, steps/mm, homed flag, and the physical driver(s) it is mapped to.
+	for (MovementSystemNumber ms = 0; ms < NumMovementSystems; ++ms)
+	{
+		int32_t pos[MaxAxesPlusExtruders];
+		mv.GetLivePositions(pos, ms);
+		line.printf("Motion system %u:\n", (unsigned int)ms);
+		platform.Message(mt, line.c_str());
+		for (size_t axis = 0; axis < numTotalAxes; ++axis)
+		{
+			const float stepsPerMm = platform.DriveStepsPerUnit(axis);
+			const float mm = Move::MotorStepsToMovement(axis, pos[axis]);
+			line.printf("  %c (axis %u)%s: endpoint=%ld steps = %.4f mm  [%.3f steps/mm, homed=%d]  driver(s) ",
+						axisLetters[axis], (unsigned int)axis,
+						(axis >= numVisibleAxes) ? " hidden" : "",
+						(long)pos[axis], (double)mm, (double)stepsPerMm, IsAxisHomed(axis) ? 1 : 0);
+			const AxisDriversConfig& cfg = platform.GetAxisDriversConfig(axis);
+			for (size_t d = 0; d < cfg.numDrivers; ++d)
+			{
+				const DriverId id = cfg.driverNumbers[d];
+				line.catf("%s%u.%u", (d == 0) ? "" : ":", (unsigned int)id.boardAddress, (unsigned int)id.localDriver);
+			}
+			line.cat("\n");
+			platform.Message(mt, line.c_str());
+		}
+	}
+
+	// 2) Shared-driver analysis. Report every physical driver referenced by two or more axes, and the
+	//    step/mm delta of each extra axis relative to the first sharer — that delta is the desync.
+	//    Uses motion system 0, where the leadscrew and compensation (V/W/A) moves run.
+	int32_t pos0[MaxAxesPlusExtruders];
+	mv.GetLivePositions(pos0, 0);
+	platform.Message(mt, "Shared physical drivers (physical estimate = SUM of sharer endpoints; MSCNT = real phase):\n");
+	bool anyShared = false;
+	for (size_t a = 0; a < numTotalAxes; ++a)
+	{
+		const AxisDriversConfig& ca = platform.GetAxisDriversConfig(a);
+		for (size_t i = 0; i < ca.numDrivers; ++i)
+		{
+			const DriverId id = ca.driverNumbers[i];
+
+			// Report each physical driver only once: skip it if any earlier axis/slot already maps to it.
+			bool alreadySeen = false;
+			for (size_t b = 0; b <= a && !alreadySeen; ++b)
+			{
+				const AxisDriversConfig& cb = platform.GetAxisDriversConfig(b);
+				const size_t lim = (b == a) ? i : cb.numDrivers;
+				for (size_t j = 0; j < lim; ++j)
+				{
+					if (cb.driverNumbers[j] == id) { alreadySeen = true; break; }
+				}
+			}
+			if (alreadySeen) { continue; }
+
+			// Collect every axis that maps to this driver.
+			size_t sharers[MaxAxes];
+			size_t numSharers = 0;
+			for (size_t b = a; b < numTotalAxes; ++b)
+			{
+				const AxisDriversConfig& cb = platform.GetAxisDriversConfig(b);
+				for (size_t j = 0; j < cb.numDrivers; ++j)
+				{
+					if (cb.driverNumbers[j] == id) { sharers[numSharers++] = b; break; }
+				}
+			}
+
+			if (numSharers >= 2)
+			{
+				anyShared = true;
+				const float stepsPerMm = platform.DriveStepsPerUnit(sharers[0]);
+
+				// The physical shaft receives the steps of EVERY axis mapped to this driver, so the
+				// firmware's best estimate of the shaft position is the SUM of the sharer endpoints,
+				// NOT their difference. RRF stores position per logical axis only; no field holds this
+				// sum. It is the quantity to compare across boot vs per-job axis re-creation: a coherent
+				// re-creation makes the same physical state yield the same sum. (The old "delta vs Z"
+				// was misleading - it is large whenever Z is simply parked high, which is not a desync.)
+				int32_t sumSteps = 0;
+				line.printf("  driver %u.%u <-", (unsigned int)id.boardAddress, (unsigned int)id.localDriver);
+				for (size_t s = 0; s < numSharers; ++s)
+				{
+					line.catf(" %c=%ld", axisLetters[sharers[s]], (long)pos0[sharers[s]]);
+					sumSteps += pos0[sharers[s]];
+				}
+				const float sumMm = (stepsPerMm != 0.0f) ? (float)sumSteps / stepsPerMm : 0.0f;
+				line.catf("  => physical ~= %ld st / %.4f mm", (long)sumSteps, (double)sumMm);
+
+				// Actual electrical phase (MSCNT) is the only electronic window into REAL step loss -
+				// the part that can differ between an affected and an unaffected printer. The leadscrews
+				// are on CAN board 1, so their MSCNT must be fetched with the Tier-2 CAN read; a local
+				// driver (board 0) could be read here via SmartDrivers::GetRegister(..mstepPos).
+				if (id.boardAddress == 0)
+				{
+					line.cat("  [MSCNT: local - Tier-2 via SmartDrivers::mstepPos]");
+				}
+				else
+				{
+					line.catf("  [MSCNT %u.%u: remote - Tier-2 CAN read]", (unsigned int)id.boardAddress, (unsigned int)id.localDriver);
+				}
+				line.cat("\n");
+				platform.Message(mt, line.c_str());
+			}
+		}
+	}
+	if (!anyShared)
+	{
+		platform.Message(mt, "  (none)\n");
+	}
+}
+
 // Handle sending a reply back to the appropriate interface(s) and update lastResult
 // Note that 'reply' may be empty. If it isn't, then we need to append newline when sending it.
 void GCodes::HandleReply(GCodeBuffer& gb, GCodeResult rslt, const char* reply) noexcept
