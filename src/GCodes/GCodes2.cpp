@@ -4801,6 +4801,46 @@ bool GCodes::HandleMcode(GCodeBuffer& gb, const StringRef& reply) THROWS(GCodeEx
 				DumpMotorState(gb.GetResponseMessageType());
 				break;
 
+			case 1001:	// Custom debug (VisionMiner): configure G-code execution tracing
+				// S<0..4> verbosity, P"usb|telnet|dwc" destinations, C"all,-daemon,-aux" input channels,
+				// F"stack,pos,..." metadata fields. Without parameters, report the current configuration.
+				// The same settings are reachable out-of-band via the rr_debugtrace HTTP request, which
+				// works even while every G-code channel is blocked executing a macro.
+				{
+					bool seen = false;
+					if (gb.Seen('S'))
+					{
+						SetDebugTraceVerbosity(gb.GetLimitedUIValue('S', DbgTraceAll + 1));
+						seen = true;
+					}
+					if (gb.Seen('P'))
+					{
+						String<StringLength100> s;
+						gb.GetQuotedString(s.GetRef(), true);
+						ParseDebugTraceDestinations(s.c_str());
+						seen = true;
+					}
+					if (gb.Seen('C'))
+					{
+						String<StringLength256> s;
+						gb.GetQuotedString(s.GetRef(), true);
+						ParseDebugTraceChannels(s.c_str());
+						seen = true;
+					}
+					if (gb.Seen('F'))
+					{
+						String<StringLength256> s;
+						gb.GetQuotedString(s.GetRef(), true);
+						ParseDebugTraceMeta(s.c_str());
+						seen = true;
+					}
+					if (!seen)
+					{
+						ReportDebugTraceConfig(reply);
+					}
+				}
+				break;
+
 			default:
 #if HAS_SBC_INTERFACE
 				// Send unknown non-binary codes to DSF so potential plugins can interpret them

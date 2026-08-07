@@ -418,6 +418,7 @@ bool StringParser::CheckMetaCommand(const StringRef& reply) THROWS(GCodeExceptio
 	// Save and clear the command letter in case ProcessConditionalGCode throws an exception, so that the error message won't include the previous command
 	const char savedCommandLetter = commandLetter;
 	commandLetter = 'E';						// we use this to flag a meta command, see GCodeException::GetMessage
+	metaCommandAlreadyTraced = false;
 	const bool b = ProcessConditionalGCode(reply, skippedBlockType, doingFile);	// this may throw a GCodeException
 	if (b)
 	{
@@ -427,7 +428,10 @@ bool StringParser::CheckMetaCommand(const StringRef& reply) THROWS(GCodeExceptio
 		{
 			CheckForMixedSpacesAndTabs();
 		}
-		reprap.GetGCodes().DebugGCodeCommand(gb);
+		if (!metaCommandAlreadyTraced)			// flow-control and abort commands log themselves with their outcome
+		{
+			reprap.GetGCodes().DebugGCodeCommand(gb);
+		}
 		Init();
 	}
 	else
@@ -565,7 +569,10 @@ bool StringParser::ProcessConditionalGCode(const StringRef& reply, BlockType ski
 
 void StringParser::ProcessIfCommand() THROWS(GCodeException)
 {
-	if (EvaluateCondition())
+	const bool cond = EvaluateCondition();
+	reprap.GetGCodes().DebugTraceFlow(gb, gb.buffer, (cond) ? "true" : "false");
+	metaCommandAlreadyTraced = true;
+	if (cond)
 	{
 		gb.GetBlockState().SetIfTrueBlock();
 	}
@@ -587,10 +594,14 @@ void StringParser::ProcessElseCommand(BlockType skippedBlockType) THROWS(GCodeEx
 
 	if (skippedBlockType == BlockType::ifFalseNoneTrue)
 	{
+		reprap.GetGCodes().DebugTraceFlow(gb, gb.buffer, "taken");
+		metaCommandAlreadyTraced = true;
 		gb.GetBlockState().SetPlainBlock();				// execute the else-block, treating it like a plain block
 	}
 	else if (skippedBlockType == BlockType::ifFalseHadTrue || gb.GetBlockState().GetType() == BlockType::ifTrue)
 	{
+		reprap.GetGCodes().DebugTraceFlow(gb, gb.buffer, "skipped");
+		metaCommandAlreadyTraced = true;
 		indentToSkipTo = gb.GetBlockIndent();			// skip forwards to the end of the if-block
 		gb.GetBlockState().SetPlainBlock();				// so that we get an error if there is another 'else' part
 	}
@@ -604,7 +615,10 @@ void StringParser::ProcessElifCommand(BlockType skippedBlockType) THROWS(GCodeEx
 {
 	if (skippedBlockType == BlockType::ifFalseNoneTrue)
 	{
-		if (EvaluateCondition())
+		const bool cond = EvaluateCondition();
+		reprap.GetGCodes().DebugTraceFlow(gb, gb.buffer, (cond) ? "true" : "false");
+		metaCommandAlreadyTraced = true;
+		if (cond)
 		{
 			gb.GetBlockState().SetIfTrueBlock();
 		}
@@ -616,6 +630,8 @@ void StringParser::ProcessElifCommand(BlockType skippedBlockType) THROWS(GCodeEx
 	}
 	else if (skippedBlockType == BlockType::ifFalseHadTrue || gb.GetBlockState().GetType() == BlockType::ifTrue)
 	{
+		reprap.GetGCodes().DebugTraceFlow(gb, gb.buffer, "skipped");
+		metaCommandAlreadyTraced = true;
 		indentToSkipTo = gb.GetBlockIndent();			// skip forwards to the end of the if-block
 		gb.GetBlockState().SetIfFalseHadTrueBlock();
 	}
@@ -637,7 +653,10 @@ void StringParser::ProcessWhileCommand() THROWS(GCodeException)
 		gb.GetBlockState().SetLoopBlock(GetFilePosition(), gb.GetLineNumber() - 1);
 	}
 
-	if (!EvaluateCondition())
+	const bool cond = EvaluateCondition();
+	reprap.GetGCodes().DebugTraceFlow(gb, gb.buffer, (cond) ? "true" : "false", (int32_t)gb.GetBlockState().GetIterations());
+	metaCommandAlreadyTraced = true;
+	if (!cond)
 	{
 		gb.GetBlockState().SetPlainBlock();
 		indentToSkipTo = gb.GetBlockIndent();			// skip forwards to the end of the block
@@ -646,6 +665,8 @@ void StringParser::ProcessWhileCommand() THROWS(GCodeException)
 
 void StringParser::ProcessBreakCommand() THROWS(GCodeException)
 {
+	reprap.GetGCodes().DebugTraceFlow(gb, gb.buffer, nullptr);
+	metaCommandAlreadyTraced = true;
 	do
 	{
 		if (gb.GetBlockIndent() == 0)
@@ -660,6 +681,8 @@ void StringParser::ProcessBreakCommand() THROWS(GCodeException)
 
 void StringParser::ProcessContinueCommand() THROWS(GCodeException)
 {
+	reprap.GetGCodes().DebugTraceFlow(gb, gb.buffer, nullptr);
+	metaCommandAlreadyTraced = true;
 	do
 	{
 		if (gb.GetBlockIndent() == 0)
@@ -848,6 +871,8 @@ void StringParser::ProcessAbortCommand(const StringRef& reply) noexcept
 		reply.copy("'abort' command executed");
 	}
 
+	reprap.GetGCodes().DebugTraceAbort(gb, reply.c_str());
+	metaCommandAlreadyTraced = true;
 	reprap.GetGCodes().AbortPrint(gb);
 }
 
@@ -1751,7 +1776,7 @@ void StringParser::AppendFullCommand(const StringRef &s) const noexcept
 // Called when we start a new file
 void StringParser::StartNewFile() noexcept
 {
-	seenLeadingSpace = seenLeadingTab = seenMetaCommand = warnedAboutMixedSpacesAndTabs = false;
+	seenLeadingSpace = seenLeadingTab = seenMetaCommand = metaCommandAlreadyTraced = warnedAboutMixedSpacesAndTabs = false;
 }
 
 #if HAS_MASS_STORAGE

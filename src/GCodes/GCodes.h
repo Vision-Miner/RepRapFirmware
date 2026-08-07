@@ -211,7 +211,50 @@ public:
 
 	void SetMappedFanSpeed(const GCodeBuffer *null gb, float f) noexcept;				// Set the speeds of fans mapped for the current tool
 	void HandleReply(GCodeBuffer& gb, GCodeResult rslt, const char *reply) noexcept;	// Handle G-Code replies
-	void DebugGCodeCommand(const GCodeBuffer& gb) const noexcept;				// Log the G-code or meta-command that is about to be executed, if global.debugGCode enables it
+
+	// Debug G-code execution trace (VisionMiner debug build).
+	// Configured via M1001 or the out-of-band rr_debugtrace HTTP request; nothing is polled from the object model.
+	// Verbosity levels are cumulative: each level includes everything the previous one reports.
+	static constexpr uint8_t DbgTraceOff = 0;			// tracing disabled
+	static constexpr uint8_t DbgTraceMacros = 1;		// macro calls/returns (M98/M99/end-of-file) and abort
+	static constexpr uint8_t DbgTraceFlow = 2;			// + if/elif/else/while/break/continue with condition results
+	static constexpr uint8_t DbgTraceMoves = 3;			// + movement commands (G0/G1/G2/G3, homing and probing)
+	static constexpr uint8_t DbgTraceAll = 4;			// + every command (G/M/T and meta)
+
+	// Which metadata fields each trace line carries
+	static constexpr uint16_t DbgMetaChannel = 0x0001;
+	static constexpr uint16_t DbgMetaLine = 0x0002;
+	static constexpr uint16_t DbgMetaFile = 0x0004;
+	static constexpr uint16_t DbgMetaSource = 0x0008;
+	static constexpr uint16_t DbgMetaStack = 0x0010;
+	static constexpr uint16_t DbgMetaIndent = 0x0020;
+	static constexpr uint16_t DbgMetaPosition = 0x0040;
+	static constexpr uint16_t DbgMetaQueue = 0x0080;
+	static constexpr uint16_t DbgMetaState = 0x0100;
+	static constexpr uint16_t DbgMetaDefault = DbgMetaChannel | DbgMetaLine | DbgMetaFile | DbgMetaSource;
+	static constexpr uint16_t DbgMetaAll = DbgMetaDefault | DbgMetaStack | DbgMetaIndent | DbgMetaPosition | DbgMetaQueue | DbgMetaState;
+
+	static constexpr uint16_t DbgAllChannelsMask = (1u << NumGCodeChannels) - 1;
+
+	void DebugGCodeCommand(const GCodeBuffer& gb) const noexcept;				// Log the command about to be executed (all commands at level 4, movement commands at level 3)
+	void DebugTraceMacroCall(const GCodeBuffer& gb, const char *macroFileName) const noexcept;	// Log entry into a macro file; call after Push, before gb.Init()
+	void DebugTraceMacroReturn(const GCodeBuffer& gb, const char *reason) const noexcept;		// Log leaving a macro file; call before popping the state
+	void DebugTraceAbort(const GCodeBuffer& gb, const char *message) const noexcept;			// Log an 'abort' meta command together with its message
+	void DebugTraceFlow(const GCodeBuffer& gb, const char *commandText, const char *result, int32_t iterations = -1) const noexcept;	// Log a flow-control meta command and its outcome
+
+	uint8_t GetDebugTraceVerbosity() const noexcept { return debugTraceVerbosity; }
+	uint16_t GetDebugTraceChannelMask() const noexcept { return debugTraceChannelMask; }
+	uint16_t GetDebugTraceMetaFlags() const noexcept { return debugTraceMetaFlags; }
+	MessageType GetDebugTraceDestinations() const noexcept { return debugTraceDestinations; }
+	void SetDebugTraceVerbosity(uint32_t v) noexcept;							// clamps to DbgTraceAll
+	void ParseDebugTraceDestinations(const char *s) noexcept;					// "usb|telnet|dwc" tokens, "off"/"none" disables
+	void ParseDebugTraceChannels(const char *s) noexcept;						// exact-set: "all", channel names, "-name" removes
+	void ParseDebugTraceMeta(const char *s) noexcept;							// "all"/"minimal" or default plus/minus field tokens
+	void AppendDebugTraceDestinations(const StringRef& str) const noexcept;
+	void AppendDebugTraceChannels(const StringRef& str) const noexcept;
+	void AppendDebugTraceMeta(const StringRef& str) const noexcept;
+	void ReportDebugTraceConfig(const StringRef& reply) const noexcept;			// human-readable summary for M1001 without parameters
+
 	void DumpMotorState(MessageType mt) const noexcept;							// M1000: dump internal per-axis motor step state (endpoints, driver map, shared-driver desync)
 	void EmergencyStop() noexcept;													// Cancel everything
 
@@ -398,7 +441,15 @@ private:
 
 	void HandleReply(GCodeBuffer& gb, OutputBuffer *reply) noexcept;
 	void HandleReplyPreserveResult(GCodeBuffer& gb, GCodeResult rslt, const char *reply) noexcept;	// Handle G-Code replies
-	MessageType GetDebugGCodeMessageType(uint16_t& metaFlags) const noexcept;				// Return where debug G-code logging should be sent, or NoDestinationMessage
+	bool DebugTraceActive(const GCodeBuffer& gb, uint8_t minLevel) const noexcept;			// Return true if tracing at 'minLevel' is enabled for this buffer's channel
+	void AppendDebugTracePrefix(const GCodeBuffer& gb, const StringRef& msg, const char *tag) const noexcept;	// Build the "DBG-GCODE [tag] field=..." prefix
+
+	// Trace configuration. Written from the GCodes task (M1001) and the network task (rr_debugtrace);
+	// each field is a single aligned word-sized store, so no locking is needed.
+	uint8_t debugTraceVerbosity = DbgTraceOff;
+	uint16_t debugTraceChannelMask = DbgAllChannelsMask;
+	uint16_t debugTraceMetaFlags = DbgMetaDefault;
+	MessageType debugTraceDestinations = (MessageType)((uint32_t)UsbMessage | (uint32_t)HttpMessage);
 
 	GCodeResult TryMacroFile(GCodeBuffer& gb) THROWS(GCodeException);								// Try to find a macro file that implements a G or M command
 

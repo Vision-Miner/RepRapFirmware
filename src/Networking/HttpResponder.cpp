@@ -547,6 +547,49 @@ bool HttpResponder::GetJsonResponse(const char *_ecv_array request, OutputBuffer
 			response->printf("{\"buff\":%u}", httpInput->BufferSpaceLeft());
 		}
 	}
+	else if (StringEqualsIgnoreCase(request, "debugtrace"))
+	{
+		// Custom debug (VisionMiner): configure the G-code execution trace out-of-band. Unlike rr_gcode
+		// this is handled directly in the network task, so it works even while every G-code channel is
+		// blocked executing a macro. Parameters (all optional): v=<0..4>, dest=usb|telnet|dwc|off,
+		// channels=<exact channel set, e.g. "all,-daemon,-aux">, meta=<metadata field list>.
+		// Always responds with the resulting configuration.
+		GCodes& gc = reprap.GetGCodes();
+		const char *const vVal = GetKeyValue("v");
+		if (vVal != nullptr)
+		{
+			gc.SetDebugTraceVerbosity(StrToU32(vVal));
+		}
+		const char *const destVal = GetKeyValue("dest");
+		if (destVal != nullptr)
+		{
+			gc.ParseDebugTraceDestinations(destVal);
+		}
+		const char *const channelsVal = GetKeyValue("channels");
+		if (channelsVal != nullptr)
+		{
+			gc.ParseDebugTraceChannels(channelsVal);
+		}
+		const char *const metaVal = GetKeyValue("meta");
+		if (metaVal != nullptr)
+		{
+			gc.ParseDebugTraceMeta(metaVal);
+		}
+
+		String<StringLength256> cfg;
+		response->printf("{\"err\":0,\"v\":%u,\"dest\":\"", gc.GetDebugTraceVerbosity());
+		gc.AppendDebugTraceDestinations(cfg.GetRef());
+		response->cat(cfg.c_str());
+		response->cat("\",\"channels\":\"");
+		cfg.Clear();
+		gc.AppendDebugTraceChannels(cfg.GetRef());
+		response->cat(cfg.c_str());
+		response->cat("\",\"meta\":\"");
+		cfg.Clear();
+		gc.AppendDebugTraceMeta(cfg.GetRef());
+		response->cat(cfg.c_str());
+		response->cat("\"}");
+	}
 #if HAS_MASS_STORAGE
 	else if (StringEqualsIgnoreCase(request, "fileinfo"))
 	{

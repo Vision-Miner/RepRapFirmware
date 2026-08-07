@@ -631,6 +631,7 @@ bool GCodes::DoFilePrint(GCodeBuffer& gb, const StringRef& reply) noexcept
 			if (!gb.IsMacroFileClosed())
 			{
 				// Finished a macro or finished processing config.g
+				DebugTraceMacroReturn(gb, "eof");
 				gb.MacroFileClosed();
 				CheckFinishedRunningConfigFile(gb);
 
@@ -770,6 +771,7 @@ bool GCodes::DoFilePrint(GCodeBuffer& gb, const StringRef& reply) noexcept
 			else
 			{
 				// Finished a macro or finished processing config.g
+				DebugTraceMacroReturn(gb, "eof");
 				gb.GetFileInput()->Reset(fd);
 				fd.Close();
 				CheckFinishedRunningConfigFile(gb);
@@ -3257,6 +3259,10 @@ bool GCodes::DoFileMacro(GCodeBuffer& gb, const char* fileName, bool reportMissi
 	}
 
 	gb.SetState(GCodeState::normal);
+	{
+		const char * const resolvedName = gb.LatestMachineState().GetFileName();
+		DebugTraceMacroCall(gb, (resolvedName != nullptr) ? resolvedName : fileName);	// before gb.Init() so the invoking command is still in the buffer
+	}
 	gb.Init();
 
 # if HAS_SBC_INTERFACE
@@ -3281,6 +3287,7 @@ void GCodes::FileMacroCyclesReturn(GCodeBuffer& gb) noexcept
 {
 	if (gb.IsDoingFileMacro())
 	{
+		DebugTraceMacroReturn(gb, "M99");
 #if HAS_SBC_INTERFACE
 		if (reprap.UsingSbcInterface())
 		{
@@ -3908,19 +3915,20 @@ void GCodes::SetMappedFanSpeed(const GCodeBuffer *null gbp, float f) noexcept
 
 namespace
 {
-	constexpr uint16_t DebugGCodeMetaChannel = 0x0001;
-	constexpr uint16_t DebugGCodeMetaLine = 0x0002;
-	constexpr uint16_t DebugGCodeMetaFile = 0x0004;
-	constexpr uint16_t DebugGCodeMetaSource = 0x0008;
-	constexpr uint16_t DebugGCodeMetaStack = 0x0010;
-	constexpr uint16_t DebugGCodeMetaIndent = 0x0020;
-	constexpr uint16_t DebugGCodeMetaPosition = 0x0040;
-	constexpr uint16_t DebugGCodeMetaQueue = 0x0080;
-	constexpr uint16_t DebugGCodeMetaState = 0x0100;
-
-	constexpr uint16_t DebugGCodeDefaultMeta = DebugGCodeMetaChannel | DebugGCodeMetaLine | DebugGCodeMetaFile | DebugGCodeMetaSource;
-	constexpr uint16_t DebugGCodeAllMeta = DebugGCodeMetaChannel | DebugGCodeMetaLine | DebugGCodeMetaFile | DebugGCodeMetaSource |
-									DebugGCodeMetaStack | DebugGCodeMetaIndent | DebugGCodeMetaPosition | DebugGCodeMetaQueue | DebugGCodeMetaState;
+	// True if this G-code number is a movement-type command (traced at verbosity level 3)
+	bool DebugGCodeIsMovementCommand(int code) noexcept
+	{
+		switch (code)
+		{
+		case 0: case 1: case 2: case 3:			// linear and arc moves
+		case 28:								// homing
+		case 29: case 30: case 32:				// bed probing
+		case 38:								// straight probe (G38.x)
+			return true;
+		default:
+			return false;
+		}
+	}
 
 	char DebugGCodeToLower(char c) noexcept
 	{
@@ -3976,174 +3984,305 @@ namespace
 
 }
 
-// Return where debug G-code logging should be sent, or NoDestinationMessage if disabled.
-// Controlled by a user global variable. Destination tokens may be in any order and
-// may be separated by '|', ':', '+', ',', ';' or whitespace:
-//   global.debugGCode = null, "off", or missing                    -> disabled
-//   global.debugGCode = "usb"                                      -> USB ACM only, default metadata
-//   global.debugGCode = "dwc"                                      -> DWC/web HTTP only, default metadata
-//   global.debugGCode = "telnet"                                   -> Telnet only, default metadata
-//   global.debugGCode = "dwc|telnet|usb"                           -> DWC/web HTTP + Telnet + USB ACM
-//   global.debugGCode = "usb|telnet:stack,pos"                     -> USB + Telnet with selected extra metadata
-//   global.debugGCode = "both"                                     -> USB ACM and DWC/web HTTP, default metadata
-//   global.debugGCode = "both|telnet:all"                          -> USB ACM + DWC/web HTTP + Telnet with all metadata
-MessageType GCodes::GetDebugGCodeMessageType(uint16_t& metaFlags) const noexcept
+// --- Debug G-code execution trace configuration ---
+// Tokens in the strings parsed below may be separated by '|', ':', '+', ',', ';' or whitespace.
+
+void GCodes::SetDebugTraceVerbosity(uint32_t v) noexcept
 {
-	metaFlags = 0;
-#if SUPPORT_OBJECT_MODEL
-	ReadLockedPointer<const VariableSet> vars = reprap.GetGlobalVariablesForReading();
-	if (vars.Ptr() == nullptr)
-	{
-		return NoDestinationMessage;
-	}
+	debugTraceVerbosity = (v > DbgTraceAll) ? DbgTraceAll : (uint8_t)v;
+}
 
-	const Variable * const v = vars->Lookup("debugGCode", strlen("debugGCode"), false);
-	if (v == nullptr)
+// Parse a destination list, e.g. "usb|dwc", "telnet", "off". "both" is a legacy alias for usb+dwc.
+void GCodes::ParseDebugTraceDestinations(const char *s) noexcept
+{
+	uint32_t dest = 0;
+	if (!DebugGCodeOptionPresent(s, "off") && !DebugGCodeOptionPresent(s, "none"))
 	{
-		return NoDestinationMessage;
+		if (DebugGCodeOptionPresent(s, "usb"))
+		{
+			dest |= (uint32_t)UsbMessage;
+		}
+		if (DebugGCodeOptionPresent(s, "telnet"))
+		{
+			dest |= (uint32_t)TelnetMessage;
+		}
+		if (DebugGCodeOptionPresent(s, "dwc") || DebugGCodeOptionPresent(s, "web") || DebugGCodeOptionPresent(s, "http"))
+		{
+			dest |= (uint32_t)HttpMessage;
+		}
+		if (DebugGCodeOptionPresent(s, "both"))
+		{
+			dest |= (uint32_t)UsbMessage | (uint32_t)HttpMessage;
+		}
 	}
+	debugTraceDestinations = (MessageType)dest;
+}
 
-	const ExpressionValue val = v->GetValue();
-	if (val.GetType() == TypeCode::None)
+// Parse a channel list with exact-set semantics: the string fully describes the new mask.
+// Plain tokens add a channel, "-name" removes one, "all" selects everything.
+// Examples: "all", "all,-daemon,-aux", "file,http,usb", "none".
+void GCodes::ParseDebugTraceChannels(const char *s) noexcept
+{
+	uint16_t mask = 0;
+	const char *p = s;
+	while (*p != '\0')
 	{
-		return NoDestinationMessage;
+		p = DebugGCodeSkipSeparators(p);
+		if (*p == '\0')
+		{
+			break;
+		}
+		bool remove = false;
+		if (*p == '-')
+		{
+			remove = true;
+			++p;
+		}
+		const char * const start = p;
+		while (!DebugGCodeIsSeparator(*p))
+		{
+			++p;
+		}
+		if (p == start)
+		{
+			continue;
+		}
+		if (DebugGCodeTokenEquals(start, p, "all"))
+		{
+			mask = (remove) ? 0 : DbgAllChannelsMask;
+		}
+		else if (DebugGCodeTokenEquals(start, p, "none"))
+		{
+			mask = 0;
+		}
+		else
+		{
+			for (size_t i = 0; i < NumGCodeChannels; ++i)
+			{
+				if (DebugGCodeTokenEquals(start, p, GCodeChannel((uint8_t)i).ToString()))
+				{
+					if (remove)
+					{
+						mask &= ~(uint16_t)(1u << i);
+					}
+					else
+					{
+						mask |= (uint16_t)(1u << i);
+					}
+					break;
+				}
+			}
+		}
 	}
+	debugTraceChannelMask = mask;
+}
 
-	String<StringLength256> mode;
-	val.AppendAsString(mode.GetRef());
-	const char * const modeString = mode.c_str();
-
-	if (DebugGCodeOptionPresent(modeString, "off"))
+// Parse the metadata field list: "all"/"full", "minimal"/"bare", or the default set adjusted by
+// field tokens (channel, line, file, source, stack, indent, pos, queue, state) and their "no..." negations.
+void GCodes::ParseDebugTraceMeta(const char *s) noexcept
+{
+	uint16_t metaFlags;
+	if (DebugGCodeOptionPresent(s, "all") || DebugGCodeOptionPresent(s, "full"))
 	{
-		return NoDestinationMessage;
+		metaFlags = DbgMetaAll;
 	}
-
-	MessageType destination = NoDestinationMessage;
-	if (DebugGCodeOptionPresent(modeString, "usb"))
-	{
-		destination = (MessageType)((uint32_t)destination | (uint32_t)UsbMessage);
-	}
-	if (DebugGCodeOptionPresent(modeString, "telnet"))
-	{
-		destination = (MessageType)((uint32_t)destination | (uint32_t)TelnetMessage);
-	}
-	if (DebugGCodeOptionPresent(modeString, "dwc") || DebugGCodeOptionPresent(modeString, "web") || DebugGCodeOptionPresent(modeString, "http"))
-	{
-		destination = (MessageType)((uint32_t)destination | (uint32_t)HttpMessage);
-	}
-	if (DebugGCodeOptionPresent(modeString, "both"))
-	{
-		destination = (MessageType)((uint32_t)destination | (uint32_t)UsbMessage | (uint32_t)HttpMessage);
-	}
-	if (destination == NoDestinationMessage)
-	{
-		return NoDestinationMessage;
-	}
-
-	if (DebugGCodeOptionPresent(modeString, "all") || DebugGCodeOptionPresent(modeString, "full"))
-	{
-		metaFlags = DebugGCodeAllMeta;
-	}
-	else if (DebugGCodeOptionPresent(modeString, "minimal") || DebugGCodeOptionPresent(modeString, "bare"))
+	else if (DebugGCodeOptionPresent(s, "minimal") || DebugGCodeOptionPresent(s, "bare"))
 	{
 		metaFlags = 0;
 	}
 	else
 	{
-		metaFlags = DebugGCodeDefaultMeta;
+		metaFlags = DbgMetaDefault;
 
-		if (DebugGCodeOptionPresent(modeString, "channel"))
+		if (DebugGCodeOptionPresent(s, "channel"))
 		{
-			metaFlags |= DebugGCodeMetaChannel;
+			metaFlags |= DbgMetaChannel;
 		}
-		if (DebugGCodeOptionPresent(modeString, "line"))
+		if (DebugGCodeOptionPresent(s, "line"))
 		{
-			metaFlags |= DebugGCodeMetaLine;
+			metaFlags |= DbgMetaLine;
 		}
-		if (DebugGCodeOptionPresent(modeString, "file"))
+		if (DebugGCodeOptionPresent(s, "file"))
 		{
-			metaFlags |= DebugGCodeMetaFile;
+			metaFlags |= DbgMetaFile;
 		}
-		if (DebugGCodeOptionPresent(modeString, "source"))
+		if (DebugGCodeOptionPresent(s, "source"))
 		{
-			metaFlags |= DebugGCodeMetaSource;
+			metaFlags |= DbgMetaSource;
 		}
-		if (DebugGCodeOptionPresent(modeString, "stack"))
+		if (DebugGCodeOptionPresent(s, "stack"))
 		{
-			metaFlags |= DebugGCodeMetaStack;
+			metaFlags |= DbgMetaStack;
 		}
-		if (DebugGCodeOptionPresent(modeString, "indent"))
+		if (DebugGCodeOptionPresent(s, "indent"))
 		{
-			metaFlags |= DebugGCodeMetaIndent;
+			metaFlags |= DbgMetaIndent;
 		}
-		if (DebugGCodeOptionPresent(modeString, "pos") || DebugGCodeOptionPresent(modeString, "position"))
+		if (DebugGCodeOptionPresent(s, "pos") || DebugGCodeOptionPresent(s, "position"))
 		{
-			metaFlags |= DebugGCodeMetaPosition;
+			metaFlags |= DbgMetaPosition;
 		}
-		if (DebugGCodeOptionPresent(modeString, "queue"))
+		if (DebugGCodeOptionPresent(s, "queue"))
 		{
-			metaFlags |= DebugGCodeMetaQueue;
+			metaFlags |= DbgMetaQueue;
 		}
-		if (DebugGCodeOptionPresent(modeString, "state"))
+		if (DebugGCodeOptionPresent(s, "state"))
 		{
-			metaFlags |= DebugGCodeMetaState;
+			metaFlags |= DbgMetaState;
 		}
 
-		if (DebugGCodeOptionPresent(modeString, "nofile"))
+		if (DebugGCodeOptionPresent(s, "nofile"))
 		{
-			metaFlags &= ~DebugGCodeMetaFile;
+			metaFlags &= ~DbgMetaFile;
 		}
-		if (DebugGCodeOptionPresent(modeString, "noline"))
+		if (DebugGCodeOptionPresent(s, "noline"))
 		{
-			metaFlags &= ~DebugGCodeMetaLine;
+			metaFlags &= ~DbgMetaLine;
 		}
-		if (DebugGCodeOptionPresent(modeString, "nochannel"))
+		if (DebugGCodeOptionPresent(s, "nochannel"))
 		{
-			metaFlags &= ~DebugGCodeMetaChannel;
+			metaFlags &= ~DbgMetaChannel;
 		}
-		if (DebugGCodeOptionPresent(modeString, "nosource"))
+		if (DebugGCodeOptionPresent(s, "nosource"))
 		{
-			metaFlags &= ~DebugGCodeMetaSource;
+			metaFlags &= ~DbgMetaSource;
 		}
 	}
-	return destination;
-#else
-	return NoDestinationMessage;
-#endif
+	debugTraceMetaFlags = metaFlags;
 }
 
-// Log the G-code or meta-command that is about to be executed, if global.debugGCode enables it.
-void GCodes::DebugGCodeCommand(const GCodeBuffer& gb) const noexcept
+void GCodes::AppendDebugTraceDestinations(const StringRef& str) const noexcept
 {
-	uint16_t metaFlags;
-	const MessageType mt = GetDebugGCodeMessageType(metaFlags);
-	if (mt == NoDestinationMessage)
+	const uint32_t dest = (uint32_t)debugTraceDestinations;
+	if (dest == 0)
 	{
+		str.cat("off");
 		return;
 	}
-
-	// Q0 is the internal command used for whole-line comments. It is not a real executable G-code command.
-	if (gb.GetCommandLetter() == 'Q' && gb.HasCommandNumber() && gb.GetCommandNumber() == 0)
+	bool first = true;
+	if ((dest & (uint32_t)UsbMessage) != 0)
 	{
+		str.cat("usb");
+		first = false;
+	}
+	if ((dest & (uint32_t)TelnetMessage) != 0)
+	{
+		if (!first) { str.cat('|'); }
+		str.cat("telnet");
+		first = false;
+	}
+	if ((dest & (uint32_t)HttpMessage) != 0)
+	{
+		if (!first) { str.cat('|'); }
+		str.cat("dwc");
+	}
+}
+
+void GCodes::AppendDebugTraceChannels(const StringRef& str) const noexcept
+{
+	const uint16_t mask = debugTraceChannelMask;
+	if (mask == DbgAllChannelsMask)
+	{
+		str.cat("all");
 		return;
 	}
+	if (mask == 0)
+	{
+		str.cat("none");
+		return;
+	}
+	bool first = true;
+	for (size_t i = 0; i < NumGCodeChannels; ++i)
+	{
+		if ((mask & (1u << i)) != 0)
+		{
+			if (!first) { str.cat(','); }
+			str.cat(GCodeChannel((uint8_t)i).ToString());
+			first = false;
+		}
+	}
+}
 
-	String<StringLength256> msg;
+void GCodes::AppendDebugTraceMeta(const StringRef& str) const noexcept
+{
+	const uint16_t metaFlags = debugTraceMetaFlags;
+	if (metaFlags == DbgMetaAll)
+	{
+		str.cat("all");
+		return;
+	}
+	if (metaFlags == 0)
+	{
+		str.cat("minimal");
+		return;
+	}
+	static const struct { uint16_t flag; const char *name; } fieldNames[] =
+	{
+		{ DbgMetaChannel, "channel" },
+		{ DbgMetaLine, "line" },
+		{ DbgMetaFile, "file" },
+		{ DbgMetaSource, "source" },
+		{ DbgMetaStack, "stack" },
+		{ DbgMetaIndent, "indent" },
+		{ DbgMetaPosition, "pos" },
+		{ DbgMetaQueue, "queue" },
+		{ DbgMetaState, "state" },
+	};
+	bool first = true;
+	for (size_t i = 0; i < ARRAY_SIZE(fieldNames); ++i)
+	{
+		if ((metaFlags & fieldNames[i].flag) != 0)
+		{
+			if (!first) { str.cat(','); }
+			str.cat(fieldNames[i].name);
+			first = false;
+		}
+	}
+}
+
+void GCodes::ReportDebugTraceConfig(const StringRef& reply) const noexcept
+{
+	static const char * const levelNames[] = { "off", "macros", "macros+flow", "macros+flow+moves", "everything" };
+	reply.printf("G-code trace: level %u (%s), destinations ", debugTraceVerbosity, levelNames[debugTraceVerbosity]);
+	AppendDebugTraceDestinations(reply);
+	reply.cat(", channels ");
+	AppendDebugTraceChannels(reply);
+	reply.cat(", fields ");
+	AppendDebugTraceMeta(reply);
+}
+
+// Return true if tracing at 'minLevel' is enabled, output goes somewhere, and this buffer's channel is selected
+bool GCodes::DebugTraceActive(const GCodeBuffer& gb, uint8_t minLevel) const noexcept
+{
+	return debugTraceVerbosity >= minLevel
+		&& debugTraceDestinations != NoDestinationMessage
+		&& (debugTraceChannelMask & (1u << gb.GetChannel().ToBaseType())) != 0;
+}
+
+// Build the "DBG-GCODE [tag] field=..." prefix of a trace line using the configured metadata fields
+void GCodes::AppendDebugTracePrefix(const GCodeBuffer& gb, const StringRef& msg, const char *tag) const noexcept
+{
 	msg.copy("DBG-GCODE");
+	if (tag != nullptr)
+	{
+		msg.catf(" [%s]", tag);
+	}
 
-	if ((metaFlags & DebugGCodeMetaChannel) != 0)
+	const uint16_t metaFlags = debugTraceMetaFlags;
+
+	if ((metaFlags & DbgMetaChannel) != 0)
 	{
 		msg.cat(" channel=");
 		msg.cat(gb.GetChannel().ToString());
 	}
 
-	if ((metaFlags & DebugGCodeMetaSource) != 0)
+	if ((metaFlags & DbgMetaSource) != 0)
 	{
 		msg.cat(" source=");
 		msg.cat((gb.IsDoingFileMacro()) ? "macro" : (gb.IsDoingFile()) ? "file" : "input");
 	}
 
-	if ((metaFlags & DebugGCodeMetaFile) != 0)
+	if ((metaFlags & DbgMetaFile) != 0)
 	{
 		const char * const fileName = gb.GetCurrentFileName();
 		if (fileName != nullptr)
@@ -4154,7 +4293,7 @@ void GCodes::DebugGCodeCommand(const GCodeBuffer& gb) const noexcept
 		}
 	}
 
-	if ((metaFlags & DebugGCodeMetaLine) != 0)
+	if ((metaFlags & DbgMetaLine) != 0)
 	{
 		const uint32_t line = gb.GetLineNumber();
 		if (line != 0)
@@ -4163,17 +4302,17 @@ void GCodes::DebugGCodeCommand(const GCodeBuffer& gb) const noexcept
 		}
 	}
 
-	if ((metaFlags & DebugGCodeMetaStack) != 0)
+	if ((metaFlags & DbgMetaStack) != 0)
 	{
 		msg.catf(" stack=%u", gb.GetStackDepth());
 	}
 
-	if ((metaFlags & DebugGCodeMetaIndent) != 0)
+	if ((metaFlags & DbgMetaIndent) != 0)
 	{
 		msg.catf(" indent=%u", gb.GetBlockIndent());
 	}
 
-	if ((metaFlags & DebugGCodeMetaPosition) != 0)
+	if ((metaFlags & DbgMetaPosition) != 0)
 	{
 		const FilePosition jobPos = gb.GetJobFilePosition();
 		if (jobPos != noFilePosition)
@@ -4189,21 +4328,189 @@ void GCodes::DebugGCodeCommand(const GCodeBuffer& gb) const noexcept
 	}
 
 #if SUPPORT_ASYNC_MOVES
-	if ((metaFlags & DebugGCodeMetaQueue) != 0)
+	if ((metaFlags & DbgMetaQueue) != 0)
 	{
 		msg.catf(" queue=%u", (unsigned int)gb.GetActiveQueueNumber());
 	}
 #endif
 
-	if ((metaFlags & DebugGCodeMetaState) != 0)
+	if ((metaFlags & DbgMetaState) != 0)
 	{
 		msg.catf(" state=%u", (unsigned int)gb.GetState());
 	}
+}
 
+// Log the command about to be executed. At level 4 every command is logged;
+// at level 3 only movement-type commands are.
+void GCodes::DebugGCodeCommand(const GCodeBuffer& gb) const noexcept
+{
+	if (!DebugTraceActive(gb, DbgTraceMoves))
+	{
+		return;
+	}
+
+	// Q0 is the internal command used for whole-line comments. It is not a real executable G-code command.
+	if (gb.GetCommandLetter() == 'Q' && gb.HasCommandNumber() && gb.GetCommandNumber() == 0)
+	{
+		return;
+	}
+
+	const bool isMove = gb.GetCommandLetter() == 'G' && gb.HasCommandNumber() && DebugGCodeIsMovementCommand(gb.GetCommandNumber());
+	if (debugTraceVerbosity < DbgTraceAll && !isMove)
+	{
+		return;
+	}
+
+	String<StringLength256> msg;
+	AppendDebugTracePrefix(gb, msg.GetRef(), (isMove) ? "MOVE" : nullptr);
 	msg.cat(": ");
 	gb.AppendFullCommand(msg.GetRef());
 	msg.cat('\n');
-	platform.Message(mt, msg.c_str());
+	platform.Message(debugTraceDestinations, msg.c_str());
+}
+
+// Log entry into a macro file. Must be called after the machine state has been pushed and the new
+// state's file name set, but before gb.Init() clears the invoking command from the buffer.
+void GCodes::DebugTraceMacroCall(const GCodeBuffer& gb, const char *macroFileName) const noexcept
+{
+	if (!DebugTraceActive(gb, DbgTraceMacros))
+	{
+		return;
+	}
+
+	String<StringLength256> msg;
+	msg.copy("DBG-GCODE [CALL]");
+
+	if ((debugTraceMetaFlags & DbgMetaChannel) != 0)
+	{
+		msg.cat(" channel=");
+		msg.cat(gb.GetChannel().ToString());
+	}
+	if ((debugTraceMetaFlags & DbgMetaStack) != 0)
+	{
+		msg.catf(" stack=%u", gb.GetStackDepth());
+	}
+
+	// Report who invoked the macro: after Push the previous machine state holds the caller's file and line
+	const GCodeMachineState * const caller = gb.LatestMachineState().GetPrevious();
+	if (caller != nullptr)
+	{
+#if HAS_MASS_STORAGE || HAS_SBC_INTERFACE || HAS_EMBEDDED_FILES
+		const char * const callerFile = caller->GetFileName();
+#else
+		const char * const callerFile = nullptr;
+#endif
+		if (callerFile != nullptr)
+		{
+			msg.catf(" from=\"%s\" line=%ld", callerFile, (long)caller->lineNumber);
+		}
+		else
+		{
+			msg.cat(" from=input");
+		}
+	}
+
+	msg.cat(": ");
+	gb.AppendFullCommand(msg.GetRef());			// the invoking command with its parameters
+	msg.catf(" -> \"%s\"\n", macroFileName);
+	platform.Message(debugTraceDestinations, msg.c_str());
+}
+
+// Log leaving a macro file (M99 or end of file). Must be called before the machine state is popped,
+// so that the state being left is still the latest one.
+void GCodes::DebugTraceMacroReturn(const GCodeBuffer& gb, const char *reason) const noexcept
+{
+	if (!DebugTraceActive(gb, DbgTraceMacros))
+	{
+		return;
+	}
+
+	String<StringLength256> msg;
+	msg.copy("DBG-GCODE [RET]");
+
+	if ((debugTraceMetaFlags & DbgMetaChannel) != 0)
+	{
+		msg.cat(" channel=");
+		msg.cat(gb.GetChannel().ToString());
+	}
+	if ((debugTraceMetaFlags & DbgMetaStack) != 0)
+	{
+		msg.catf(" stack=%u", gb.GetStackDepth());
+	}
+
+	msg.catf(" reason=%s", reason);
+
+	const GCodeMachineState& ms = gb.LatestMachineState();
+#if HAS_MASS_STORAGE || HAS_SBC_INTERFACE || HAS_EMBEDDED_FILES
+	const char * const macroFile = ms.GetFileName();
+	if (macroFile != nullptr)
+	{
+		msg.catf(" file=\"%s\" line=%ld", macroFile, (long)ms.lineNumber);
+	}
+#endif
+
+	const GCodeMachineState * const caller = ms.GetPrevious();
+	if (caller != nullptr)
+	{
+#if HAS_MASS_STORAGE || HAS_SBC_INTERFACE || HAS_EMBEDDED_FILES
+		const char * const callerFile = caller->GetFileName();
+#else
+		const char * const callerFile = nullptr;
+#endif
+		if (callerFile != nullptr)
+		{
+			msg.catf(" -> \"%s\" line=%ld", callerFile, (long)caller->lineNumber);
+		}
+		else
+		{
+			msg.cat(" -> input");
+		}
+	}
+
+	msg.cat('\n');
+	platform.Message(debugTraceDestinations, msg.c_str());
+}
+
+// Log an 'abort' meta command together with the message it will report
+void GCodes::DebugTraceAbort(const GCodeBuffer& gb, const char *message) const noexcept
+{
+	if (!DebugTraceActive(gb, DbgTraceMacros))
+	{
+		return;
+	}
+
+	String<StringLength256> msg;
+	AppendDebugTracePrefix(gb, msg.GetRef(), "ABORT");
+	msg.cat(": abort msg=\"");
+	msg.cat(message);
+	msg.cat("\"\n");
+	platform.Message(debugTraceDestinations, msg.c_str());
+}
+
+// Log a flow-control meta command (if/elif/else/while/break/continue) and its outcome.
+// 'result' is "true"/"false" for evaluated conditions, "taken"/"skipped" for else/elif branches,
+// or nullptr when there is no outcome to report. 'iterations' >= 0 reports the loop iteration count.
+void GCodes::DebugTraceFlow(const GCodeBuffer& gb, const char *commandText, const char *result, int32_t iterations) const noexcept
+{
+	if (!DebugTraceActive(gb, DbgTraceFlow))
+	{
+		return;
+	}
+
+	String<StringLength256> msg;
+	AppendDebugTracePrefix(gb, msg.GetRef(), "FLOW");
+	msg.cat(": ");
+	msg.cat(commandText);
+	if (iterations >= 0)
+	{
+		msg.catf(" (iteration %" PRIi32 ")", iterations);
+	}
+	if (result != nullptr)
+	{
+		msg.catf(" => %s", result);
+	}
+	msg.cat('\n');
+	platform.Message(debugTraceDestinations, msg.c_str());
 }
 
 // M1000: dump the firmware's internal per-axis motor step state.

@@ -164,6 +164,7 @@ private:
 	bool seenLeadingSpace;
 	bool seenLeadingTab;
 	bool seenMetaCommand;
+	bool metaCommandAlreadyTraced;						// True if the flow/abort debug trace already logged the current meta command
 	bool warnedAboutMixedSpacesAndTabs;
 	bool overflowed;
 	bool seenExpression;
