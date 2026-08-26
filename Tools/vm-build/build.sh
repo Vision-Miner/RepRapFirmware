@@ -367,20 +367,22 @@ list_target_names() {
 	for entry in "${TARGETS[@]}"; do IFS='|' read -r name _ _ _ <<< "$entry"; printf '%s\n' "$name"; done
 }
 
+# Report every file the given targets promise. Returns non-zero when one is
+# missing, so a build can never be reported as successful without its binary.
 report_artifacts() {
-	local cfg file found=0
+	local cfg file rc=0
 	for cfg in "$@"; do
 		while read -r file; do
 			if [ -f "$file" ]; then
-				found=1
 				ok "$(basename "$file") — $(du -h "$file" | cut -f1)  sha256 $(sha256sum "$file" | cut -c1-16)…"
 				info "   ${file}"
 			else
 				err "expected artifact missing: ${file}"
+				rc=1
 			fi
 		done < <(target_artifacts "$cfg")
 	done
-	[ "$found" = 1 ] || warn "No artifacts found — check the Eclipse output above."
+	return $rc
 }
 
 # --- Commands ----------------------------------------------------------------
@@ -482,7 +484,7 @@ cmd_build() {
 	section "Building ${cfgs[*]}"
 	run_eclipse -build "${cfgs[@]}"
 	section "Artifacts"
-	report_artifacts "${cfgs[@]}"
+	report_artifacts "${cfgs[@]}" || die "The build reported success but an expected artifact is missing — check the Eclipse output above."
 }
 
 cmd_rebuild() {
@@ -492,7 +494,7 @@ cmd_rebuild() {
 	[ -d "$ECLIPSE_DATA" ] && { info "Removing Eclipse workspace metadata…"; rm -rf "$ECLIPSE_DATA"; }
 	run_eclipse -cleanBuild "${cfgs[@]}"
 	section "Artifacts"
-	report_artifacts "${cfgs[@]}"
+	report_artifacts "${cfgs[@]}" || die "The build reported success but an expected artifact is missing — check the Eclipse output above."
 }
 
 # A release build is the one whose output is meant to be shipped, so it refuses
@@ -541,10 +543,12 @@ cmd_release_build() {
 	run_eclipse -cleanBuild "${cfgs[@]}"
 
 	section "Artifacts"
-	report_artifacts "${cfgs[@]}"
+	report_artifacts "${cfgs[@]}" || die "The build reported success but an expected artifact is missing — check the Eclipse output above."
+
+	# The full checksums, in a form that can be pasted into a comparison.
 	local cfg file
 	for cfg in "${cfgs[@]}"; do
-		while read -r file; do [ -f "$file" ] && sha256sum "$file"; done < <(target_artifacts "$cfg")
+		while read -r file; do sha256sum "$file"; done < <(target_artifacts "$cfg")
 	done
 }
 
