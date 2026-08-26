@@ -147,8 +147,25 @@ current_version() { sed -n 's/^# *define[ \t]*MAIN_VERSION[ \t]*"\(.*\)".*/\1/p'
 # --- Downloads ---------------------------------------------------------------
 # A download is only trusted once its sha256 is pinned in repos.conf. Until then
 # the fetched value is printed so it can be pinned deliberately.
+# Checksums are pinned as "<algo>:<hex>"; a bare value is read as sha256. Vendors
+# publish different algorithms — ARM publish sha256, Eclipse sha512 — and pinning
+# what they publish avoids downloading a release just to hash it.
+checksum_of() {
+	case "$2" in
+		sha256) sha256sum "$1" | cut -d' ' -f1 ;;
+		sha512) sha512sum "$1" | cut -d' ' -f1 ;;
+		*) die "unsupported checksum algorithm '$2'" ;;
+	esac
+}
+
 fetch_verify() {
-	local label="$1" url="$2" dest="$3" want="$4" got
+	local label="$1" url="$2" dest="$3" pin="$4" algo="sha256" want="" got
+	case "$pin" in
+		sha256:*) want="${pin#sha256:}" ;;
+		sha512:*) algo="sha512"; want="${pin#sha512:}" ;;
+		*:*)      die "${label}: unrecognised checksum pin '${pin}'" ;;
+		*)        want="$pin" ;;
+	esac
 	info "Downloading ${label}…"
 	if have curl; then
 		curl -fL --retry 3 --connect-timeout 30 -o "$dest" "$url" || { rm -f "$dest"; die "Failed to download ${label} from ${url}"; }
@@ -157,15 +174,15 @@ fetch_verify() {
 	else
 		die "Neither curl nor wget is available."
 	fi
-	got="$(sha256sum "$dest" | cut -d' ' -f1)"
+	got="$(checksum_of "$dest" "$algo")"
 	if [ -n "$want" ]; then
-		[ "$got" = "$want" ] || { rm -f "$dest"; die "${label}: sha256 mismatch
+		[ "$got" = "$want" ] || { rm -f "$dest"; die "${label}: ${algo} mismatch
   expected ${want}
   got      ${got}"; }
-		ok "${label}: sha256 verified"
+		ok "${label}: ${algo} verified"
 	else
-		warn "${label}: sha256 not pinned — add this to repos.conf:"
-		printf '      %s\n' "$got"
+		warn "${label}: checksum not pinned — add this to repos.conf:"
+		printf '      sha256:%s\n' "$(checksum_of "$dest" sha256)"
 	fi
 }
 
@@ -189,22 +206,33 @@ install_toolchain() {
 }
 
 setup_toolchains() {
-	local with_wifi_fw="$1"
+	local with_wifi_fw="$1" with_eclipse="$2"
 	section "Toolchains"
 	mkdir -p "$BIN_DIR"
-	install_toolchain "ARM GCC ${ARM_GCC_VERSION}" "$ARM_GCC_URL" "$ARM_GCC_DIR" "arm-none-eabi-gcc" "$ARM_GCC_SHA256"
+	install_toolchain "ARM GCC ${ARM_GCC_VERSION}" "$ARM_GCC_URL" "$ARM_GCC_DIR" "arm-none-eabi-gcc" "$ARM_GCC_CHECKSUM"
 	if [ "$with_wifi_fw" = "yes" ]; then
-		install_toolchain "Xtensa GCC" "$XTENSA_GCC_URL" "$XTENSA_GCC_DIR" "xtensa-lx106-elf-gcc" "$XTENSA_GCC_SHA256"
+		install_toolchain "Xtensa GCC" "$XTENSA_GCC_URL" "$XTENSA_GCC_DIR" "xtensa-lx106-elf-gcc" "$XTENSA_GCC_CHECKSUM"
 	else
 		info "Xtensa toolchain skipped (only the WiFi-module firmware needs it; pass --with-wifi-fw)"
 	fi
-	if [ -n "$ECLIPSE_URL" ] && [ ! -x "${ECLIPSE_DIR}/eclipse" ]; then
+
+	# The pinned Eclipse is a 400 MB download, so it is fetched only when the
+	# machine has none — which is the case on a CI runner — or when asked for.
+	if [ -x "${ECLIPSE_DIR}/eclipse" ]; then
+		ok "Eclipse already installed in tools/eclipse"
+	elif [ -z "$ECLIPSE_URL" ]; then
+		info "No ECLIPSE_URL pinned — using the Eclipse installed on this machine"
+	elif [ "$with_eclipse" != "yes" ] && eclipse_has_cdt 2>/dev/null; then
+		info "Eclipse with CDT found on this machine — skipping the pinned copy (pass --with-eclipse to install it anyway)"
+	else
 		mkdir -p "$ECLIPSE_DIR"
 		local archive="${TOOLS_DIR}/.dl-eclipse.archive"
-		fetch_verify "Eclipse CDT" "$ECLIPSE_URL" "$archive" "$ECLIPSE_SHA256"
+		fetch_verify "Eclipse ${ECLIPSE_EXPECTED_VERSION}" "$ECLIPSE_URL" "$archive" "$ECLIPSE_CHECKSUM"
+		info "Extracting Eclipse…"
 		tar -xf "$archive" -C "$ECLIPSE_DIR" --strip-components=1
 		rm -f "$archive"
-		ok "Eclipse CDT installed into tools/eclipse"
+		[ -x "${ECLIPSE_DIR}/eclipse" ] || die "Eclipse extracted but tools/eclipse/eclipse is missing — the archive layout may have changed."
+		ok "Eclipse installed into tools/eclipse"
 	fi
 }
 
@@ -374,7 +402,7 @@ cmd_doctor() {
 	fi
 
 	local missing=() c
-	for c in git tar xz sha256sum; do have "$c" || missing+=("$c"); done
+	for c in git tar xz sha256sum sha512sum; do have "$c" || missing+=("$c"); done
 	have curl || have wget || missing+=("curl or wget")
 	if [ ${#missing[@]} -eq 0 ]; then ok "Base tools present"
 	else err "Missing base tools: ${missing[*]}"; problems=$((problems + 1)); fi
@@ -428,11 +456,12 @@ cmd_doctor() {
 }
 
 cmd_bootstrap() {
-	local do_sync="no" with_wifi_fw="no" arg
+	local do_sync="no" with_wifi_fw="no" with_eclipse="no" arg
 	for arg in "$@"; do
 		case "$arg" in
 			--sync) do_sync="yes" ;;
 			--with-wifi-fw) with_wifi_fw="yes" ;;
+			--with-eclipse) with_eclipse="yes" ;;
 			*) die "bootstrap: unknown option '${arg}'" ;;
 		esac
 	done
@@ -440,7 +469,7 @@ cmd_bootstrap() {
 	section "Bootstrapping ${WS}"
 	[ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ] || die "The pinned toolchains are Linux x86_64 only."
 	mkdir -p "$WS" "$DEPS_DIR" "$TOOLS_DIR" "$BIN_DIR"
-	setup_toolchains "$with_wifi_fw"
+	setup_toolchains "$with_wifi_fw" "$with_eclipse"
 	setup_deps "$do_sync" "$with_wifi_fw"
 	setup_crcappender
 	section "Done"
@@ -519,6 +548,42 @@ cmd_release_build() {
 	done
 }
 
+# Print the files a release consists of, one path per line, so that a release
+# workflow does not need a second copy of the target list. --maps prints the
+# linker map files instead.
+cmd_artifacts() {
+	local maps="no" arg file cfg base entry
+	local -a rest=() cfgs=()
+	for arg in "$@"; do
+		case "$arg" in
+			--maps) maps="yes" ;;
+			*) rest+=("$arg") ;;
+		esac
+	done
+
+	if [ "${#rest[@]}" -eq 0 ]; then
+		local name
+		while read -r name; do cfgs+=("$name"); done < <(list_target_names)
+	else
+		resolve_targets "${rest[@]}"
+		cfgs=("${RESOLVED_TARGETS[@]}")
+	fi
+
+	for cfg in "${cfgs[@]}"; do
+		if [ "$maps" = "yes" ]; then
+			entry="$(target_entry "$cfg")"
+			IFS='|' read -r _ base _ _ <<< "$entry"
+			file="${RRF_ROOT}/${cfg}/${base}.map"
+			[ -f "$file" ] && printf '%s\n' "$file"
+		else
+			while read -r file; do
+				[ -f "$file" ] && printf '%s\n' "$file"
+			done < <(target_artifacts "$cfg")
+		fi
+	done
+	return 0
+}
+
 cmd_clean() {
 	local with_deps="no" arg
 	for arg in "$@"; do
@@ -575,11 +640,13 @@ ${C_BOLD}Commands:${C_RESET}
   ${C_GREEN}doctor${C_RESET}                    Check the environment and report what is missing
   ${C_GREEN}bootstrap${C_RESET} [--sync]        Fetch toolchains + dependencies, install CrcAppender
             [--with-wifi-fw]  also fetch the ESP8266 sources and Xtensa toolchain
+            [--with-eclipse]  install the pinned Eclipse even if one is present
   ${C_GREEN}build${C_RESET} [target…]           Incremental build            (default: ${DEFAULT_TARGET})
   ${C_GREEN}rebuild${C_RESET} [target…]         Clean build from a fresh Eclipse workspace
   ${C_GREEN}release-build${C_RESET} [target…]   Reproducible build of the current commit (all targets by default)
   ${C_GREEN}clean${C_RESET} [--deps]            Remove build outputs and Eclipse metadata
   ${C_GREEN}targets${C_RESET}                   List the configured targets
+  ${C_GREEN}artifacts${C_RESET} [--maps] [t…]   Print the built release files, one path per line
   ${C_GREEN}help${C_RESET}                      Show this message
 
 ${C_BOLD}Environment:${C_RESET}
@@ -602,6 +669,7 @@ main() {
 		release-build|release) cmd_release_build "$@" ;;
 		clean)                 cmd_clean "$@" ;;
 		targets)               cmd_targets "$@" ;;
+		artifacts)             cmd_artifacts "$@" ;;
 		help|-h|--help)        cmd_help ;;
 		*) err "Unknown command: ${cmd}"; echo; cmd_help; exit 2 ;;
 	esac
