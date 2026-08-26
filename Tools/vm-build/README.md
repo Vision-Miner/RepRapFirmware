@@ -130,12 +130,17 @@ git tag 3.5.4-vm.2
 git push origin 3.5.4-vm.2
 ```
 
-Building and publishing the release is currently done by hand:
+Pushing the tag is what starts a release. The `Release` workflow checks the tag
+against `src/Version.h`, builds it, and opens a **draft** release with the
+firmware and its linker map attached. The description is GitHub's generated list
+of changes since the previous release; write the human part into the draft and
+publish it when it reads the way you want.
+
+The same build can be reproduced locally at any time:
 
 ```sh
 git checkout 3.5.4-vm.2
 ./Tools/vm-build/build.sh release-build
-gh release create 3.5.4-vm.2 Duet3_MB6HC/Duet3Firmware_MB6HC.bin
 ```
 
 `release-build` stops before compiling if the working tree has uncommitted
@@ -207,7 +212,10 @@ caches the list of available completions.
 
 ## Current status
 
-Release builds and their publication are manual. A workflow triggered by pushing
-a `*-vm.*` tag, which verifies the version, builds, and attaches the binaries to
-a GitHub release, is planned. The toolchain archive checksums in `repos.conf` are
-not yet filled in; `bootstrap` prints the checksum of each archive it downloads.
+GitHub disables Actions in a forked repository until they are enabled by hand in
+Settings → Actions; until that is done, pushing a tag builds nothing.
+
+The Xtensa toolchain has no pinned checksum, because Espressif publish none next
+to the archive — `bootstrap` prints the checksum of what it downloaded so it can
+be pinned deliberately. It is only used for the WiFi-module firmware, which no
+current target needs.

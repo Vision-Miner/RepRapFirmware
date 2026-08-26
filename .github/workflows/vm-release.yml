@@ -1,0 +1,121 @@
+name: Release
+
+# Pushing a tag is the only trigger. The tag names the version, and that version
+# must already be committed in src/Version.h — see Tools/vm-build/README.md.
+# Upstream tags (3.5.4, 3.6.3) do not match this pattern and are ignored.
+on:
+  push:
+    tags:
+      - '*-vm.*'
+
+permissions:
+  contents: write
+
+# A release build is never cancelled by a later run.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # Everything that is not the firmware itself — toolchain, libraries, Eclipse
+  # metadata — lives here, beside the checkout.
+  RRF_WS: ${{ github.workspace }}/ws
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v4
+        with:
+          path: ws/repos/RepRapFirmware
+
+      # Cheap and first: a mismatch here means the tag is wrong, and nothing
+      # below is worth running.
+      - name: Verify the tag against src/Version.h
+        working-directory: ws/repos/RepRapFirmware
+        run: ./Tools/vm-build/check-version.sh "$GITHUB_REF_NAME"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up .NET 6
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
+
+      # Eclipse pulls in SWT even when run headless, so it needs an X server.
+      - name: Install X dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y xvfb libxtst6 libxrender1
+
+      # The compiler and Eclipse are ~2 GB unpacked; the key changes only when a
+      # pin in repos.conf changes.
+      - name: Restore the toolchain cache
+        uses: actions/cache@v4
+        with:
+          path: ws/tools
+          key: vm-tools-${{ runner.os }}-${{ hashFiles('ws/repos/RepRapFirmware/Tools/vm-build/repos.conf') }}
+
+      - name: Install the toolchain, Eclipse and the pinned libraries
+        working-directory: ws/repos/RepRapFirmware
+        run: ./Tools/vm-build/build.sh bootstrap --with-eclipse
+
+      - name: Check the environment
+        working-directory: ws/repos/RepRapFirmware
+        run: ./Tools/vm-build/build.sh doctor
+
+      # release-build refuses to run unless the tree is clean, every library is
+      # at its pinned commit and the compiler is the pinned one. It also fixes
+      # the compilation date to the date of the commit.
+      - name: Build
+        working-directory: ws/repos/RepRapFirmware
+        run: xvfb-run -a ./Tools/vm-build/build.sh release-build
+
+      # The file list comes from targets.conf through build.sh, so this workflow
+      # holds no second copy of it.
+      - name: Collect the artifacts
+        working-directory: ws/repos/RepRapFirmware
+        run: |
+          mkdir -p "$RUNNER_TEMP/release" "$RUNNER_TEMP/symbols"
+          ./Tools/vm-build/build.sh artifacts        | xargs -r cp -t "$RUNNER_TEMP/release/"
+          ./Tools/vm-build/build.sh artifacts --maps | xargs -r cp -t "$RUNNER_TEMP/release/"
+          ./Tools/vm-build/build.sh artifacts --maps | xargs -r cp -t "$RUNNER_TEMP/symbols/"
+          ls -l "$RUNNER_TEMP/release" "$RUNNER_TEMP/symbols"
+
+      # The maps are attached to the release, where they are kept for as long as
+      # the release exists, and to the run as well, so they can be picked up
+      # before the draft is published.
+      - name: Keep the linker maps with this run
+        uses: actions/upload-artifact@v4
+        with:
+          name: symbols-${{ github.ref_name }}
+          path: ${{ runner.temp }}/symbols
+          retention-days: 90
+
+      - name: Create the draft release
+        working-directory: ws/repos/RepRapFirmware
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The release notes are GitHub's own; the description is written by
+          # hand while reviewing the draft. Only the starting point is chosen
+          # here — the previous Vision Miner tag, or the upstream release this
+          # line is based on when there is no previous one. Without it the first
+          # release would summarise the entire history of RepRapFirmware.
+          prev="$(gh api "repos/$GITHUB_REPOSITORY/tags" --paginate --jq '.[].name' \
+                  | grep -E -- '-vm\.[0-9]+$' | sort -V \
+                  | awk -v cur="$GITHUB_REF_NAME" '$0 == cur { print p; exit } { p = $0 }')"
+          if [ -z "$prev" ]; then
+            prev="$(sed -n 's/^VM_VERSION_BASE="\(.*\)"/\1/p' Tools/vm-build/repos.conf)"
+          fi
+          echo "Generating notes starting from ${prev}"
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --generate-notes \
+            --notes-start-tag "$prev" \
+            "$RUNNER_TEMP"/release/*
