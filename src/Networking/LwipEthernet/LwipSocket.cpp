@@ -172,6 +172,7 @@ void LwipSocket::ConnectionClosedGracefully() noexcept
 
 void LwipSocket::ConnectionError(err_t err) noexcept
 {
+	connectionAborted = true;
 	DiscardReceivedData();
 	connectionPcb = nullptr;
 
@@ -204,6 +205,7 @@ void LwipSocket::ReInit() noexcept
 	DiscardReceivedData();
 	whenConnected = whenWritten = whenClosed = 0;
 	responderFound = false;
+	connectionAborted = false;
 	readIndex = unAcked = 0;
 }
 

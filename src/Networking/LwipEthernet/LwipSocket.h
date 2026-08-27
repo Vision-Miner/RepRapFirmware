@@ -45,6 +45,7 @@ public:
 	bool ReadBuffer(const uint8_t *&buffer, size_t &len) noexcept override;
 	void Taken(size_t len) noexcept override;
 	bool CanRead() const noexcept override;
+	bool ConnectionWasAborted() const noexcept override { return connectionAborted; }
 	bool CanSend() const noexcept override;
 	size_t Send(const uint8_t *data, size_t length) noexcept override;
 	void Send() noexcept override { }
@@ -69,6 +70,7 @@ private:
 	uint32_t whenWritten;
 	uint32_t whenClosed;
 	bool responderFound;
+	bool connectionAborted;
 
 	tcp_pcb *connectionPcb;
 	pbuf *volatile receivedData;

@@ -43,6 +43,7 @@ public:
 	virtual bool ReadBuffer(const uint8_t *&buffer, size_t &len) noexcept = 0;
 	virtual void Taken(size_t len) noexcept = 0;
 	virtual bool CanRead() const noexcept = 0;
+	virtual bool ConnectionWasAborted() const noexcept { return false; }
 	virtual bool CanSend() const noexcept = 0;
 	virtual size_t Send(const uint8_t *data, size_t length) noexcept = 0;
 	virtual void Send() noexcept = 0;
