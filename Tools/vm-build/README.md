@@ -77,6 +77,13 @@ Binaries are written inside the repository, into a directory named after the
 build configuration — for example `Duet3_MB6HC/Duet3Firmware_MB6HC.bin`. These
 directories are ignored by git.
 
+Build output is condensed to one line per file — `CXX src/Movement/DDA.cpp`,
+`LD`, `BIN`, `CRC` — because the makefiles Eclipse generates otherwise echo a
+two-kilobyte command per source file, which buries compiler warnings. Warnings,
+errors and anything else unrecognised are printed unchanged. `--verbose` (or
+`V=1`) shows the raw output, and the complete log of every build is written to
+`<workspace>/last-build.log` regardless.
+
 `build` is incremental and is the normal command during development. `rebuild`
 discards the Eclipse workspace first and is useful after changes to `.cproject`,
 after moving between distant commits, or when a build failure has no obvious

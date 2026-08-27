@@ -55,6 +55,11 @@ for conf in repos.conf targets.conf; do
 done
 
 VERSION_HEADER="${RRF_ROOT}/src/Version.h"
+BUILD_LOG="${WS}/last-build.log"
+
+# Quiet build output by default; V=1 or --verbose shows everything Eclipse says.
+VERBOSE="no"
+if [ "${V:-0}" = "1" ]; then VERBOSE="yes"; fi
 
 # --- Logging -----------------------------------------------------------------
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -317,6 +322,86 @@ setup_crcappender() {
 	dotnet6_present || warn ".NET 6 runtime missing — CrcAppender will fail during the post-build step"
 }
 
+# --- Build output ------------------------------------------------------------
+# Eclipse CDT generates makefiles that echo three lines and a ~2 KB command per
+# source file, which buries compiler warnings. This rewrites that into the shape
+# the kernel build uses:
+#
+#   CXX     src/Movement/DDA.cpp
+#   LD      Duet3Firmware_MB6HC.elf
+#
+# Only recognised noise is dropped; every other line is passed through verbatim,
+# so a new Eclipse version can make the output verbose again but can never hide a
+# diagnostic. The full log is always written to $BUILD_LOG.
+#
+# The file being compiled is read from the command line rather than from the
+# "Building file:" echo above it: with make -j those echoes interleave between
+# jobs, and a line-by-line rule cannot mispair what it never pairs.
+build_filter() {
+	awk '
+	function emit(tool, what) { printf "  %-7s %s\n", tool, what; fflush() }
+	function base(p,   n, a) { n = split(p, a, "/"); return a[n] }
+	function scoped(p) { return (project != "" && project != "RepRapFirmware") ? project "/" p : p }
+
+	/^INFO: / { next }
+	/ org\.(apache|eclipse|slf4j)\./ { next }
+	index($0, "Opening \047") == 1 { next }
+	# Only make\047s chatter is dropped. Anything else it says — "*** Error 2",
+	# "No rule to make target" — is how a build reports failure.
+	/^make(\[[0-9]+\])?: (Entering|Leaving) directory/ { next }
+	/^make(\[[0-9]+\])?: Nothing to be done/ { next }
+	/^make( -[^ ]+)* all[ ]*$/ { next }
+	/^[ \t]*$/ { next }
+
+	# Which project the following lines belong to.
+	index($0, "**** ") && index($0, " for project ") {
+		p = substr($0, index($0, " for project ") + 13)
+		sub(/ \*\*\*\*.*$/, "", p)
+		project = p
+		next
+	}
+
+	# A clean per-project summary says nothing; one with errors or warnings stays.
+	/Build Finished\. 0 errors, 0 warnings/ { next }
+
+	/^Building file: / { next }
+	/^Building target: / { next }
+	/^Invoking: / { next }
+	/^Finished building/ { next }
+	/^Generating binary file$/ { next }
+	/^Firmware binary: / { next }
+	index($0, "Saving workspace.") == 1 { next }
+
+	/^CRC32 = / { emit("CRC", $3); next }
+
+	# Tool invocations. A diagnostic such as "arm-none-eabi-g++: error: …" has a
+	# colon where a command has a space, so it does not match here and is printed.
+	/^arm-none-eabi-[a-zA-Z+_-]+ / {
+		cmd = $1
+		n = 0; rest = $0
+		while (match(rest, /"[^"]*"/)) {
+			q[++n] = substr(rest, RSTART + 1, RLENGTH - 2)
+			rest = substr(rest, RSTART + RLENGTH)
+		}
+		if (cmd ~ /-objcopy$/ && n >= 1) { emit("BIN", base(q[n])); next }
+		if (cmd ~ /-ar$/ && n >= 1)      { emit("AR",  base(q[1])); next }
+		if (index($0, " -c ") > 0 && n >= 1) {
+			src = q[n]
+			sub(/^\.\.\//, "", src)
+			tool = "CC"
+			if (src ~ /\.(cpp|cc|cxx)$/) tool = "CXX"
+			else if (src ~ /\.[Ss]$/)    tool = "AS"
+			emit(tool, scoped(src))
+			next
+		}
+		if (match($0, /-o "[^"]+"/)) { emit("LD", base(substr($0, RSTART + 4, RLENGTH - 5))); next }
+		print; fflush(); next
+	}
+
+	{ print; fflush() }
+	'
+}
+
 # --- Eclipse -----------------------------------------------------------------
 run_eclipse() {
 	local mode="$1"; shift
@@ -345,7 +430,16 @@ run_eclipse() {
 	export PATH="${BIN_DIR}:${PATH}"
 	info "Eclipse: ${ecl} ($(eclipse_version 2>/dev/null || printf 'unknown version'))"
 	info "ARM GCC: ${gcc} ($("$gcc" -dumpversion))"
-	"$ecl" "${args[@]}"
+
+	# Both streams are captured, so the log holds everything in the order it
+	# happened. pipefail is on, so a failing Eclipse still fails the pipeline.
+	mkdir -p "$WS"
+	if [ "$VERBOSE" = "yes" ]; then
+		"$ecl" "${args[@]}" 2>&1 | tee "$BUILD_LOG"
+	else
+		"$ecl" "${args[@]}" 2>&1 | tee "$BUILD_LOG" | build_filter
+	fi
+	info "full log: ${BUILD_LOG}"
 }
 
 # Resolve the target list for a build command into RESOLVED_TARGETS. A global
@@ -653,9 +747,16 @@ ${C_BOLD}Commands:${C_RESET}
   ${C_GREEN}artifacts${C_RESET} [--maps] [t…]   Print the built release files, one path per line
   ${C_GREEN}help${C_RESET}                      Show this message
 
+${C_BOLD}Options:${C_RESET}
+  -v, --verbose             Show the full Eclipse and compiler output
+
 ${C_BOLD}Environment:${C_RESET}
   RRF_WS            Workspace directory (default: ${WS})
   RRF_ALLOW_DIRTY   Allow a release build from a dirty tree (not reproducible)
+  V=1               Same as --verbose
+  NO_COLOR          Plain output
+
+${C_DIM}Every build writes its full log to ${BUILD_LOG}${C_RESET}
 
 ${C_DIM}Pins live in Tools/vm-build/repos.conf, targets in targets.conf.
 Releasing: edit src/Version.h, commit, tag — see Tools/vm-build/README.md.${C_RESET}
@@ -663,6 +764,18 @@ EOF
 }
 
 main() {
+	# --verbose is accepted anywhere, so it never has to be typed before the
+	# command name and never reaches the target-name parser.
+	local -a rest=()
+	local a
+	for a in "$@"; do
+		case "$a" in
+			-v|--verbose) VERBOSE="yes" ;;
+			*) rest+=("$a") ;;
+		esac
+	done
+	if [ "${#rest[@]}" -gt 0 ]; then set -- "${rest[@]}"; else set --; fi
+
 	local cmd="${1:-help}"
 	shift || true
 	case "$cmd" in
