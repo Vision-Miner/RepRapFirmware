@@ -346,11 +346,16 @@ build_filter() {
 	/^INFO: / { next }
 	/ org\.(apache|eclipse|slf4j)\./ { next }
 	index($0, "Opening \047") == 1 { next }
+	# Printed instead of "Opening" when the workspace is created from scratch,
+	# and it names nothing at all; build.sh lists the projects itself.
+	/^Create\.$/ { next }
 	# Only make\047s chatter is dropped. Anything else it says — "*** Error 2",
 	# "No rule to make target" — is how a build reports failure.
 	/^make(\[[0-9]+\])?: (Entering|Leaving) directory/ { next }
 	/^make(\[[0-9]+\])?: Nothing to be done/ { next }
-	/^make( -[^ ]+)* all[ ]*$/ { next }
+	# The command echo: "make -j16 all", "make clean". Anything make says about
+	# a problem has a colon after its name and does not match this.
+	/^make([ ]+-[^ ]+)*[ ]+[A-Za-z][A-Za-z0-9._-]*[ ]*$/ { next }
 	/^[ \t]*$/ { next }
 
 	# Which project the following lines belong to.
@@ -370,9 +375,21 @@ build_filter() {
 	/^Finished building/ { next }
 	/^Generating binary file$/ { next }
 	/^Firmware binary: / { next }
+	/^arm-none-eabi-ar: creating / { next }
 	index($0, "Saving workspace.") == 1 { next }
 
 	/^CRC32 = / { emit("CRC", $3); next }
+
+	# The clean recipe echoes every object it removes — hundreds of paths on one
+	# line. The directory being cleaned is all that is worth reading.
+	/^rm -rf / {
+		if (NF < 3) { print; fflush(); next }
+		p = $3
+		sub(/^\.\//, "", p)
+		if (index(p, "/") > 0) sub(/\/[^\/]*$/, "", p)
+		emit("CLEAN", scoped(p))
+		next
+	}
 
 	# Tool invocations. A diagnostic such as "arm-none-eabi-g++: error: …" has a
 	# colon where a command has a space, so it does not match here and is printed.
@@ -418,11 +435,15 @@ run_eclipse() {
 	# Import exactly the projects we pin. -importAll on a directory would also
 	# pull in whatever else happens to sit there, and two projects with the same
 	# name make the workspace unusable.
+	local -a imported=("RepRapFirmware")
 	args+=(-import "$RRF_ROOT")
 	for entry in "${DEPS[@]}"; do
 		IFS='|' read -r name _ _ _ _ <<< "$entry"
 		dir="$(dep_dir "$name")"
-		[ -f "${dir}/.project" ] && args+=(-import "$dir")
+		if [ -f "${dir}/.project" ]; then
+			args+=(-import "$dir")
+			imported+=("$name")
+		fi
 	done
 
 	for cfg in "$@"; do args+=("$mode" "RepRapFirmware/${cfg}"); done
@@ -430,6 +451,7 @@ run_eclipse() {
 	export PATH="${BIN_DIR}:${PATH}"
 	info "Eclipse: ${ecl} ($(eclipse_version 2>/dev/null || printf 'unknown version'))"
 	info "ARM GCC: ${gcc} ($("$gcc" -dumpversion))"
+	info "projects: ${imported[*]}"
 
 	# Both streams are captured, so the log holds everything in the order it
 	# happened. pipefail is on, so a failing Eclipse still fails the pipeline.
